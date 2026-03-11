@@ -6,7 +6,7 @@
 - **Story Points**: 2
 - **Branch**: `feature/MLID-1868-intake-skipped-notes`
 - **Base Branch**: `develop`
-- **Status**: To Do
+- **Status**: In QA
 
 ---
 
@@ -51,12 +51,16 @@ Key findings from the investigation:
 ### Step 4 — Create SkipReasonDialog component
 
 - **Files**: `apps/web/app/intakes/[id]/SkipReasonDialog.tsx`, `apps/web/app/intakes/[id]/SkipReasonDialog.test.tsx`
+- **Pattern**: MUI Dialog (Pattern 2) — matches `DeleteConfirmModal` and `AddEditHospitalModal`
+  - Uses `Dialog`, `DialogTitle`, `DialogContent`, `DialogActions` from `@mui/material`
+  - `maxWidth="sm"`, `fullWidth`
+  - TextField for reason input, Cancel + Skip buttons in `DialogActions`
 - **What**: Create a modal dialog that:
   - Opens when the user selects "Skip Intake"
   - Contains a text field for the reason (mandatory — submit button disabled when empty)
   - Has Cancel and Skip buttons
   - Calls `skipIntake(intakeId, reason)` on submit
-  - Uses MUI Dialog components consistent with existing patterns
+  - Prevents close during submission (`disableEscapeKeyDown`)
 
 ### Step 5 — Wire the dialog into the intake detail page
 
@@ -111,6 +115,39 @@ Key findings from the investigation:
 - **Input validation**: `skipReason` must be a non-empty string, trimmed, with reasonable max length (e.g., 500 chars)
 - **Authorization**: Existing intake PATCH authorization applies — no new permissions needed
 - **PHI handling**: Skip reasons should not contain PHI; no special masking needed but input should be sanitized
+
+---
+
+## QA Testing
+
+**Date**: 2026-03-11
+
+### Test Document
+
+| Field | Value |
+|-------|-------|
+| **_id** | `69b1e7f3f3cbe0589e5ed5bf` |
+| **Patient** | Sarah Kowalczyk |
+| **Type** | spruceFax |
+| **Original status** | `needsReview` |
+| **skipReason entered** | `testing from Alejandro Gomez` |
+
+### Verification
+
+- Confirmed via MongoDB MCP that after skipping, the document had `status: 'skipped'` and `skipReason: 'testing from Alejandro Gomez'`.
+- Skip is safe and fully reversible — it only updates `status` and `skipReason` fields. No jobs, webhooks, or external API calls are triggered.
+
+### Queries
+
+**Find the test document:**
+```js
+db.intakes.find({ _id: ObjectId('69b1e7f3f3cbe0589e5ed5bf') }, { status: 1, skipReason: 1, 'patient.firstName': 1, 'patient.lastName': 1 })
+```
+
+**Rollback to original status:**
+```js
+db.intakes.updateOne({ _id: ObjectId('69b1e7f3f3cbe0589e5ed5bf') }, { $set: { status: 'needsReview' }, $unset: { skipReason: '' } })
+```
 
 ---
 
