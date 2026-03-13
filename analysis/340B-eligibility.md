@@ -80,21 +80,53 @@ The 340B eligibility calculation returns a **string** with 3 possible outcomes:
 ### Resolution diagram
 
 ```
-order
-│
-├── 1. Is provider NPI in any active hospital system?
-│   └──► hospitalSystems WHERE providers[].npi == order.provider AND deletedAt == null
-│        ├── No matches   → "No" (stop here)
-│        └── Matched: ["Hospital ABC", "Hospital XYZ"] → continue
-│
-├── 2. What is the patient's primary active insurance type?
-│   └──► patients → patient_insurances (priority='1', status='Active')
-│        ├── No insurance found    → "Waiting on Insurance Input"
-│        ├── payer_type == "Commercial" → "Hospital ABC, Hospital XYZ"
-│        └── payer_type != "Commercial" → "No"
-│
-└── Result: string
+                        ┌─────────────────────┐
+                        │   Order enters      │
+                        │   340B check        │
+                        └──────────┬──────────┘
+                                   │
+                                   ▼
+                  ┌──────────────────────────────────┐
+                  │  Is the provider NPI in any      │
+                  │  active hospital system?          │
+                  │  (deletedAt == null)              │
+                  └───────────┬────────────┬─────────┘
+                              │            │
+                           No │            │ Yes (matched hospitals)
+                              ▼            ▼
+               ┌──────────────────┐   ┌─────────────────────────┐
+               │ "No"             │   │  Does the patient have  │
+               │  ■ STOP          │   │  a primary active       │
+               └──────────────────┘   │  insurance?             │
+                                      └──────┬──────────┬───────┘
+                                             │          │
+                                          No │          │ Yes
+                                             ▼          ▼
+                                  ┌─────────────────┐  ┌──────────────────┐
+                                  │ "Waiting on     │  │  Is the payer    │
+                                  │  Insurance      │  │  type            │
+                                  │  Input"         │  │  "Commercial"?   │
+                                  │  ■ STOP         │  └──────┬─────┬────┘
+                                  └─────────────────┘         │     │
+                                                           No │     │ Yes
+                                                              ▼     ▼
+                                                     ┌──────────┐  ┌───────────────────┐
+                                                     │ "No"     │  │ "Hospital ABC,    │
+                                                     │  ■ STOP  │  │  Hospital XYZ"    │
+                                                     └──────────┘  │  (joined names)   │
+                                                                   │  ■ STOP           │
+                                                                   └───────────────────┘
 ```
+
+**3 gates (in order):**
+
+| Gate | Check | Pass condition | Fail result |
+|------|-------|----------------|-------------|
+| 1. Hospital match | Provider NPI in active hospital system | At least 1 match (deletedAt == null) | "No" |
+| 2. Insurance exists | Patient has primary active insurance | Found (priority='1', status='Active') | "Waiting on Insurance Input" |
+| 3. Payer type | Insurance type is Commercial | `payer_type_name == "Commercial"` | "No" |
+
+All 3 gates must pass to reach **matched hospital names** (comma-joined). Any single failure short-circuits to its respective result.
 
 ---
 

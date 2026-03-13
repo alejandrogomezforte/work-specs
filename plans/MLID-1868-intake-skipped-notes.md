@@ -6,13 +6,13 @@
 - **Story Points**: 2
 - **Branch**: `feature/MLID-1868-intake-skipped-notes`
 - **Base Branch**: `develop`
-- **Status**: In QA
+- **Status**: In QA (v2 — UI revisions applied per PO feedback)
 
 ---
 
 ## Summary
 
-When an intake is skipped in the intake analyzer, require a mandatory reason note via a popup dialog before allowing the skip. Store the note on the intake document and display it in the intakes list. Rename the "Errors" column to "Note" and show the skip reason there for skipped intakes (while still showing error indicators for non-skipped intakes with errors).
+When an intake is skipped in the intake analyzer, require a mandatory reason note via a popup dialog before allowing the skip. Store the note on the intake document and display it in the intakes list. Keep the "Errors" column for errors only. Display the skip reason below the status text for skipped intakes, with expandable/collapsible truncation for long notes.
 
 ---
 
@@ -67,19 +67,34 @@ Key findings from the investigation:
 - **Files**: `apps/web/app/intakes/[id]/page.tsx`
 - **What**: When user clicks "Skip Intake" action, instead of directly calling the skip API, open the SkipReasonDialog. On dialog submit, perform the skip with the reason. On success, refetch the intake and show success message.
 
-### Step 6 — Rename "Errors" column to "Note" and display skip reason
+### Step 6 — Keep "Errors" column as-is, show skip reason below status
 
 - **Files**: `apps/web/app/intakes/page.tsx`, `apps/web/app/intakes/page.test.tsx`
 - **What**:
-  - Rename column header from "Errors" to "Note"
-  - For skipped intakes: display the `skipReason` text
-  - For non-skipped intakes with errors: continue showing `ErrorIndicator` as before
+  - **Do NOT rename the "Errors" column** — leave it as "Errors" showing `ErrorIndicator` for all intakes with errors, regardless of status.
+  - **Show skip reason in the Status column**: For rows where `status === 'skipped'` and `skipReason` exists, render the skip reason text below the status badge/text.
+  - **Expandable truncation**: The skip reason text must be truncated to 1 line with a "show more" / "show less" toggle link. Implementation:
+    1. Create an `ExpandableText` component (inline in the page file or as a small shared component):
+       - Accept a `text: string` prop
+       - Use `useState` for `expanded` (boolean) and `overflows` (boolean)
+       - Use `useRef` on the text element and `useEffect` to detect overflow: `el.scrollHeight > el.clientHeight + 1`
+       - When collapsed, apply CSS truncation: `display: '-webkit-box'`, `WebkitLineClamp: 1`, `WebkitBoxOrient: 'vertical'`, `overflow: 'hidden'`
+       - When expanded, remove the clamping styles (render with no inline style override)
+       - Render a "show more" / "show less" link below the text, visible only when `overflows || expanded`
+       - Wrap the component in a `<div onMouseDown={(e) => e.stopPropagation()}>` to prevent the click from triggering row selection in the table
+    2. In the Status column cell renderer, after the existing status content, conditionally render:
+       ```tsx
+       {intake.status === 'skipped' && intake.skipReason && (
+         <ExpandableText text={intake.skipReason} />
+       )}
+       ```
+    3. Ensure the row height accommodates the expanded text — if using a fixed row height, switch to auto row height for rows with skip reasons, or use `getRowHeight={() => 'auto'}` if the table supports it.
   - Ensure the `skipReason` field is returned in the intakes list API response (it comes from the model, so no API changes needed for the list endpoint)
 
 ### Step 7 — Display skip reason on the intake detail page
 
 - **Files**: `apps/web/app/intakes/[id]/page.tsx`
-- **What**: When the intake status is `skipped` and `skipReason` exists, display the skip reason in a visible section (e.g., near the status indicator or in the errors/warnings area).
+- **What**: When the intake status is `skipped` and `skipReason` exists, display the skip reason in a visible section (e.g., near the status indicator or in the errors/warnings area). Use the same `ExpandableText` component from Step 6 if the text could be long, or display it in full if space allows on the detail page.
 
 ---
 
@@ -95,8 +110,8 @@ Key findings from the investigation:
 | `apps/web/app/intakes/[id]/SkipReasonDialog.tsx` | Create | Modal dialog for mandatory skip reason |
 | `apps/web/app/intakes/[id]/SkipReasonDialog.test.tsx` | Create | Tests for SkipReasonDialog |
 | `apps/web/app/intakes/[id]/page.tsx` | Modify | Wire dialog to skip action, show skip reason in detail view |
-| `apps/web/app/intakes/page.tsx` | Modify | Rename "Errors" to "Note", show skip reason for skipped intakes |
-| `apps/web/app/intakes/page.test.tsx` | Modify | Update tests for column rename and skip reason display |
+| `apps/web/app/intakes/page.tsx` | Modify | Add `ExpandableText` component, show skip reason below status for skipped intakes |
+| `apps/web/app/intakes/page.test.tsx` | Modify | Add tests for skip reason display in status column and expand/collapse behavior |
 
 ---
 
@@ -105,7 +120,7 @@ Key findings from the investigation:
 - **Unit tests**: SkipReasonDialog rendering, validation (empty reason disables submit), submit/cancel callbacks
 - **API integration tests**: PATCH with skipReason, 400 when skipping without reason, skipReason cleared on status change
 - **Service tests**: Updated skipIntake function sends reason
-- **Page tests**: Column renamed to "Note", skip reason shown for skipped intakes, error indicator shown for non-skipped with errors
+- **Page tests**: Skip reason shown below status for skipped intakes, "Errors" column unchanged, expand/collapse toggle works, error indicator still shown for intakes with errors
 - **Manual verification**: Skip an intake, verify dialog appears, enter reason, verify it shows in "Note" column and detail page
 
 ---
@@ -147,6 +162,21 @@ db.intakes.find({ _id: ObjectId('69b1e7f3f3cbe0589e5ed5bf') }, { status: 1, skip
 **Rollback to original status:**
 ```js
 db.intakes.updateOne({ _id: ObjectId('69b1e7f3f3cbe0589e5ed5bf') }, { $set: { status: 'needsReview' }, $unset: { skipReason: '' } })
+```
+
+**Find second test document (demo test):**
+```js
+db.intakes.find({ _id: ObjectId('69b2ceeaf09c0a6980f3bca2') }, { status: 1, skipReason: 1, type: 1, 'patient.firstName': 1, 'patient.lastName': 1 })
+```
+
+**Rollback second test document:**
+```js
+db.intakes.updateOne({ _id: ObjectId('69b2ceeaf09c0a6980f3bca2') }, { $set: { status: 'needsReview' }, $unset: { skipReason: '' } })
+```
+
+**Set long skipReason (~500 chars) for testing truncation/expand UI:**
+```js
+db.intakes.updateOne({ _id: ObjectId('69b2ceeaf09c0a6980f3bca2') }, { $set: { skipReason: 'Lorem ipsum dolor sit amet consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia.' } })
 ```
 
 ---
