@@ -29,6 +29,7 @@ Six collections participate in the pharmacy eligibility calculation. Only fields
 | Field | Type | Purpose |
 |-------|------|---------|
 | `_id` | ObjectId | Matched from `order.drug` |
+| `is_treatment` | boolean | If `true`, order is automatically not pharmacy eligible |
 | `pharmacyEligible` | boolean \| undefined | Whether the drug is pharmacy eligible. **Updated 3/4/2026:** only `false` means ineligible; `true`, `null`, or `undefined` all count as eligible |
 
 ### `patientLocations` (already looked up by existing pipeline)
@@ -90,10 +91,13 @@ The pharmacy eligibility calculation returns a **string** with 3 possible outcom
 | Outcome | Condition |
 |---------|-----------|
 | `"Waiting on Insurance Input"` | Patient has no primary active insurance |
-| `"Yes"` | Drug is **not** explicitly ineligible **AND** location is pharmacy eligible **AND** insurance condition is met |
-| `"No"` | Any of the three criteria is not met |
+| `"No"` | Drug is a treatment (`is_treatment == true`) |
+| `"Yes"` | Drug is **not** a treatment **AND** **not** explicitly ineligible **AND** location is pharmacy eligible **AND** insurance condition is met |
+| `"No"` | Any of the criteria is not met |
 
 > **Updated 3/4/2026:** The drug check changed from "must be explicitly `true`" to "must not be explicitly `false`". Drugs with `pharmacyEligible: null` or `undefined` are now treated as eligible.
+>
+> **Updated 3/24/2026:** Added treatment check — if the drug is a treatment (`is_treatment == true`), the order is automatically not pharmacy eligible.
 
 ### Insurance condition
 
@@ -114,18 +118,21 @@ order
 │   └──► patient_insurances (priority='1', status='Active')
 │        └── No insurance found → "Waiting on Insurance Input" (stop here)
 │
-├── 2. Is the drug NOT explicitly ineligible?
+├── 2. Is the drug a treatment?
+│   └──► drug.is_treatment == true? → "No" (stop here)
+│
+├── 3. Is the drug NOT explicitly ineligible?
 │   └──► drug.pharmacyEligible != false? (true/null/undefined all pass)
 │
-├── 3. Is the location pharmacy eligible?
+├── 4. Is the location pharmacy eligible?
 │   └──► site.isPharmacyEligible == true?
 │
-├── 4. Does the insurance meet pharmacy criteria?
+├── 5. Does the insurance meet pharmacy criteria?
 │   ├── Medicare / Medicare Advantage → auto-pass
 │   ├── Commercial / Medicaid → check insurance_plans.isPharmacyEligible == true
 │   └── Other → fail
 │
-└── All three checks pass? → "Yes"
+└── All four checks pass? → "Yes"
     Any check fails?       → "No"
 ```
 
@@ -210,7 +217,12 @@ Only needed when payer type is `"Commercial"` or `"Medicaid"`. The `$lookup` alw
             case: { $eq: [{ $size: { $ifNull: ['$_primaryInsurance', []] } }, 0] },
             then: 'Waiting on Insurance Input'
           },
-          // All three conditions met → "Yes"
+          // Drug is a treatment → "No"
+          {
+            case: { $eq: [{ $ifNull: ['$drug.is_treatment', false] }, true] },
+            then: 'No'
+          },
+          // All four conditions met → "Yes"
           {
             case: {
               $and: [
@@ -262,11 +274,12 @@ Only needed when payer type is `"Commercial"` or `"Medicaid"`. The `$lookup` alw
 
 **Logic flow:**
 1. If `_primaryInsurance` is empty → `"Waiting on Insurance Input"`
-2. If drug eligible + location eligible + insurance criteria met → `"Yes"`
-3. Otherwise → `"No"`
+2. If drug is a treatment → `"No"`
+3. If drug eligible + location eligible + insurance criteria met → `"Yes"`
+4. Otherwise → `"No"`
 
 **Edge cases handled by `$ifNull` defaults:**
-- `drug` is a string (not found in lidrugs) → `pharmacyEligible` is undefined → defaults to `null` → passes (not explicitly `false`)
+- `drug` is a string (not found in lidrugs) → `is_treatment` is undefined → defaults to `false` → passes; `pharmacyEligible` is undefined → defaults to `null` → passes (not explicitly `false`)
 - `site` is null (not found) → `isPharmacyEligible` is undefined → defaults to `false`
 - Insurance plan not found → `isPharmacyEligible` is undefined → lookup returns empty → not `true` → fails check
 

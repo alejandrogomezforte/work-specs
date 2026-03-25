@@ -6,18 +6,19 @@ Reference IDs for manual testing of the Pharmacy Eligible column.
 
 The pharmacy eligibility calculation returns a **string** with 3 possible outcomes, evaluated in order:
 
-| # | Outcome | Has Primary Insurance? | Drug Pharmacy Eligible? | Site Pharmacy Eligible? | Insurance Condition | Displayed Value |
-|---|---------|------------------------|-------------------------|-------------------------|---------------------|-----------------|
-| 1 | Waiting | No | (not evaluated) | (not evaluated) | (not evaluated) | `"Waiting on Insurance Input"` |
-| 2 | Yes | Yes | Not explicitly `false` | `true` | Met (see below) | `"Yes"` |
-| 3 | No | Yes | Any fails | Any fails | Any fails | `"No"` |
+| # | Outcome | Has Primary Insurance? | Is Treatment? | Drug Pharmacy Eligible? | Site Pharmacy Eligible? | Insurance Condition | Displayed Value |
+|---|---------|------------------------|---------------|-------------------------|-------------------------|---------------------|-----------------|
+| 1 | Waiting | No | (not evaluated) | (not evaluated) | (not evaluated) | (not evaluated) | `"Waiting on Insurance Input"` |
+| 2 | No | Yes | `true` | (not evaluated) | (not evaluated) | (not evaluated) | `"No"` |
+| 3 | Yes | Yes | `false`/undefined | Not explicitly `false` | `true` | Met (see below) | `"Yes"` |
+| 4 | No | Yes | `false`/undefined | Any fails | Any fails | Any fails | `"No"` |
 
 **Insurance condition:**
 - Medicare / Medicare Advantage -> **auto-pass** (case-insensitive regex)
 - Commercial / Medicaid -> pass **only if** `insurance_plans.isPharmacyEligible == true`
 - Any other payer type -> **fail**
 
-**Evaluation order:** Insurance presence is checked first. If none, result is "Waiting on Insurance Input". Then all three conditions (drug, site, insurance) must pass for "Yes". If any fails, result is "No".
+**Evaluation order:** Insurance presence is checked first. If none, result is "Waiting on Insurance Input". Then the treatment check — if the drug is a treatment, result is "No". Then all three remaining conditions (drug eligibility, site, insurance) must pass for "Yes". If any fails, result is "No".
 
 ### Decision Flow Diagram
 
@@ -36,18 +37,26 @@ The pharmacy eligibility calculation returns a **string** with 3 possible outcom
                            No │            │ Yes
                               ▼            ▼
                ┌──────────────────┐   ┌─────────────────────────┐
-               │ "Waiting on      │   │  Is the drug pharmacy   │
-               │  Insurance Input"│   │  eligible?              │
+               │ "Waiting on      │   │  Is the drug a          │
+               │  Insurance Input"│   │  treatment?             │
                │  ■ STOP          │   │                         │
                └──────────────────┘   └──────┬──────────┬───────┘
                                              │          │
-                                          No │          │ Yes
+                                         Yes │          │ No
                                              ▼          ▼
-                                    ┌──────────┐  ┌───────────────────────┐
-                                    │ "No"     │  │  Is the location      │
-                                    │  ■ STOP  │  │  pharmacy eligible?   │
-                                    └──────────┘  │                       │
-                                                  └──────┬──────┬─────────┘
+                                    ┌──────────┐  ┌─────────────────────────┐
+                                    │ "No"     │  │  Is the drug pharmacy   │
+                                    │  ■ STOP  │  │  eligible?              │
+                                    └──────────┘  │                         │
+                                                  └──────┬──────────┬───────┘
+                                                         │          │
+                                                      No │          │ Yes
+                                                         ▼          ▼
+                                                ┌──────────┐  ┌───────────────────────┐
+                                                │ "No"     │  │  Is the location      │
+                                                │  ■ STOP  │  │  pharmacy eligible?   │
+                                                └──────────┘  │                       │
+                                                              └──────┬──────┬─────────┘
                                                          │      │
                                                       No │      │ Yes
                                                          ▼      ▼
@@ -87,16 +96,17 @@ The pharmacy eligibility calculation returns a **string** with 3 possible outcom
                                              └─────────────┘
 ```
 
-**4 gates (in order):**
+**5 gates (in order):**
 
 | Gate | Check | Pass condition | Fail result |
 |------|-------|----------------|-------------|
 | 1. Insurance exists | Patient has primary active insurance | Found | "Waiting on Insurance Input" |
-| 2. Drug eligible | Drug is pharmacy eligible | Not explicitly `false` (true/null/undefined all pass) | "No" |
-| 3. Location eligible | Location is pharmacy eligible | `isPharmacyEligible == true` | "No" |
-| 4. Insurance type | Insurance type meets criteria | Medicare/MA: auto-pass. Commercial/Medicaid: insurance plan must be pharmacy eligible. Other: fail | "No" |
+| 2. Not a treatment | Drug is not a treatment | `is_treatment` is `false` or undefined | "No" |
+| 3. Drug eligible | Drug is pharmacy eligible | Not explicitly `false` (true/null/undefined all pass) | "No" |
+| 4. Location eligible | Location is pharmacy eligible | `isPharmacyEligible == true` | "No" |
+| 5. Insurance type | Insurance type meets criteria | Medicare/MA: auto-pass. Commercial/Medicaid: insurance plan must be pharmacy eligible. Other: fail | "No" |
 
-All 4 gates must pass to reach **"Yes"**. Any single failure short-circuits to its respective result.
+All 5 gates must pass to reach **"Yes"**. Any single failure short-circuits to its respective result.
 
 ---
 
@@ -104,16 +114,17 @@ All 4 gates must pass to reach **"Yes"**. Any single failure short-circuits to i
 
 ### Drugs
 
-| Name | _id | pharmacyEligible | Treated As |
-|------|-----|------------------|------------|
-| TREMFYA | 69839ec25313bcc28e0ecc81 | `true` | Eligible |
-| QA Drug (Sodium, Billirubin) | 698c536eef01c5ef8e6059b9 | `true` | Eligible |
-| TEST01 | 699ccfa692d3290d3bceb871 | `true` | Eligible |
-| Actemra | 693885079879dc15c6a1de62 | *(undefined)* | Eligible (not explicitly `false`) |
-| Skyrizi | 6938863d9879dc15c6a1de68 | *(undefined)* | Eligible (not explicitly `false`) |
-| Asceniv | 693896d59879dc15c6a1de68 | *(undefined)* | Eligible (not explicitly `false`) |
-| QA Test drug | 698f717d26577db9d23befd8 | `false` | Not eligible |
-| agomez test drug | 69af60e4cfaf3469b51668a2 | `false` | Not eligible |
+| Name | _id | is_treatment | pharmacyEligible | Treated As |
+|------|-----|--------------|------------------|------------|
+| TREMFYA | 69839ec25313bcc28e0ecc81 | `false` | `true` | Eligible |
+| QA Drug (Sodium, Billirubin) | 698c536eef01c5ef8e6059b9 | `false` | `true` | Eligible |
+| TEST01 | 699ccfa692d3290d3bceb871 | `false` | `true` | Eligible |
+| Actemra | 693885079879dc15c6a1de62 | `false` | *(undefined)* | Eligible (not explicitly `false`) |
+| Skyrizi | 6938863d9879dc15c6a1de68 | `false` | *(undefined)* | Eligible (not explicitly `false`) |
+| Asceniv | 693896d59879dc15c6a1de68 | `false` | *(undefined)* | Eligible (not explicitly `false`) |
+| QA Test drug | 698f717d26577db9d23befd8 | `false` | `false` | Not eligible |
+| agomez test drug | 69af60e4cfaf3469b51668a2 | `false` | `false` | Not eligible |
+| QA test treatment 2 | 69c197c6bb8e5e7683c7f183 | **`true`** | *(undefined)* | Not eligible (treatment) |
 
 ### Sites (Patient Locations)
 
@@ -160,45 +171,55 @@ All 4 gates must pass to reach **"Yes"**. Any single failure short-circuits to i
 
 ### Outcome 1: "Waiting on Insurance Input" (no primary active insurance)
 
-| Patient | Patient _id | Drug | Site | Expected Result |
-|---------|-------------|------|------|-----------------|
-| Anthony Giguere | 666c5a6fe20aab1b7a20bb6c | TREMFYA | Alexandria, Virginia | Waiting on Insurance Input |
-| Sarah Ryder | 666c59f0e20aab1b7a20bb6b | Actemra | Augusta, Maine | Waiting on Insurance Input |
+| Patient | Patient _id | we_infuse_id | Drug | Site | Expected Result |
+|---------|-------------|--------------|------|------|-----------------|
+| Anthony Giguere | 666c5a6fe20aab1b7a20bb6c | 987246 | TREMFYA | Alexandria, Virginia | Waiting on Insurance Input |
+| Sarah Ryder | 666c59f0e20aab1b7a20bb6b | 767632 | Actemra | Augusta, Maine | Waiting on Insurance Input |
 
-### Outcome 2a: "Yes" — Medicare/Medicare Advantage auto-pass
+### Outcome 3a: "Yes" — Medicare/Medicare Advantage auto-pass
 
 Use a pharmacy-eligible drug + pharmacy-eligible site + Medicare patient. Medicare auto-passes without checking insurance plan.
 
-| Patient | Patient _id | Drug | Site | Payer Type | Expected Result |
-|---------|-------------|------|------|------------|-----------------|
-| Remedios Jandusay | 68f1411f886cee3aa11e1690 | TREMFYA | Alexandria, Virginia | Medicare Advantage | Yes |
-| Robin Stocks | 6807cc0684836fa1a2683a57 | Actemra | Concord, New Hampshire | Medicare | Yes |
-| Anne Bailey | 69407711f308335625c6cb66 | Skyrizi | Augusta, Maine | Medicare Advantage | Yes |
+| Patient | Patient _id | we_infuse_id | Drug | Site | Payer Type | Expected Result |
+|---------|-------------|--------------|------|------|------------|-----------------|
+| Remedios Jandusay | 68f1411f886cee3aa11e1690 | 1012283 | TREMFYA | Alexandria, Virginia | Medicare Advantage | Yes |
+| Robin Stocks | 6807cc0684836fa1a2683a57 | 767045 | Actemra | Concord, New Hampshire | Medicare | Yes |
+| Anne Bailey | 69407711f308335625c6cb66 | 1055632 | Skyrizi | Augusta, Maine | Medicare Advantage | Yes |
 
-### Outcome 2b: "Yes" — Commercial/Medicaid with eligible plan
+### Outcome 3b: "Yes" — Commercial/Medicaid with eligible plan
 
-| Patient | Patient _id | Drug | Site | Payer Type | Plan | Expected Result |
-|---------|-------------|------|------|------------|------|-----------------|
-| Chelsea Beaulieu | 6807cc0684836fa1a2683876 | TREMFYA | Alexandria, Virginia | Commercial | Anthem BCBS NH Commercial | Yes |
+| Patient | Patient _id | we_infuse_id | Drug | Site | Payer Type | Plan | Expected Result |
+|---------|-------------|--------------|------|------|------------|------|-----------------|
+| Chelsea Beaulieu | 6807cc0684836fa1a2683876 | 452282 | TREMFYA | Alexandria, Virginia | Commercial | Anthem BCBS NH Commercial | Yes |
 
-### Outcome 3a: "No" — Commercial/Medicaid with ineligible plan
+### Outcome 3: "No" — drug is a treatment
 
-| Patient | Patient _id | Drug | Site | Payer Type | Plan Pharm? | Expected Result |
-|---------|-------------|------|------|------------|-------------|-----------------|
-| Kevin Angelli | 6807cc0084836fa1a268330b | Actemra | Augusta, Maine | Commercial | `false` | No |
-| Reid Pizzonia | 68baedcd76aacd981d9e8cf3 | TREMFYA | Concord, New Hampshire | Medicaid | `false` | No |
+Use any treatment (`is_treatment == true`) — regardless of other conditions, the result is always "No".
 
-### Outcome 3b: "No" — site not pharmacy eligible
+| Patient | Patient _id | we_infuse_id | Drug | is_treatment | Site | Expected Result | Order _id |
+|---------|-------------|--------------|------|--------------|------|-----------------|-----------|
+| Chelsea Beaulieu | 6807cc0684836fa1a2683876 | 452282 | QA test treatment 2 | `true` | Alexandria, Virginia | No | 69c2ddae2e8e1dd3472e9ac6 |
 
-| Patient | Patient _id | Drug | Site | Site Pharm? | Expected Result |
-|---------|-------------|------|------|-------------|-----------------|
-| Remedios Jandusay | 68f1411f886cee3aa11e1690 | TREMFYA | Bangor, Maine | `false` | No |
-| Robin Stocks | 6807cc0684836fa1a2683a57 | Actemra | Pharmacy (Test), not Clinic | `false` | No |
-| Anne Bailey | 69407711f308335625c6cb66 | Skyrizi | Test Clinic | `false` | No |
+> **Note:** Chelsea would otherwise qualify as "Yes" (eligible plan: Anthem BCBS NH Commercial, eligible site: Alexandria, Virginia), but the treatment gate short-circuits to "No" at gate 2.
 
-### Outcome 3c: "No" — drug explicitly ineligible
+### Outcome 4a: "No" — Commercial/Medicaid with ineligible plan
 
-| Patient | Patient _id | Drug | Drug Pharm? | Site | Expected Result |
-|---------|-------------|------|-------------|------|-----------------|
-| Remedios Jandusay | 68f1411f886cee3aa11e1690 | QA Test drug | `false` | Alexandria, Virginia | No |
-| Robin Stocks | 6807cc0684836fa1a2683a57 | agomez test drug | `false` | Augusta, Maine | No |
+| Patient | Patient _id | we_infuse_id | Drug | Site | Payer Type | Plan Pharm? | Expected Result |
+|---------|-------------|--------------|------|------|------------|-------------|-----------------|
+| Kevin Angelli | 6807cc0084836fa1a268330b | 755870 | Actemra | Augusta, Maine | Commercial | `false` | No |
+| Reid Pizzonia | 68baedcd76aacd981d9e8cf3 | 977503 | TREMFYA | Concord, New Hampshire | Medicaid | `false` | No |
+
+### Outcome 4b: "No" — site not pharmacy eligible
+
+| Patient | Patient _id | we_infuse_id | Drug | Site | Site Pharm? | Expected Result |
+|---------|-------------|--------------|------|------|-------------|-----------------|
+| Remedios Jandusay | 68f1411f886cee3aa11e1690 | 1012283 | TREMFYA | Bangor, Maine | `false` | No |
+| Robin Stocks | 6807cc0684836fa1a2683a57 | 767045 | Actemra | Pharmacy (Test), not Clinic | `false` | No |
+| Anne Bailey | 69407711f308335625c6cb66 | 1055632 | Skyrizi | Test Clinic | `false` | No |
+
+### Outcome 4c: "No" — drug explicitly ineligible
+
+| Patient | Patient _id | we_infuse_id | Drug | Drug Pharm? | Site | Expected Result |
+|---------|-------------|--------------|------|-------------|------|-----------------|
+| Remedios Jandusay | 68f1411f886cee3aa11e1690 | 1012283 | QA Test drug | `false` | Alexandria, Virginia | No |
+| Robin Stocks | 6807cc0684836fa1a2683a57 | 767045 | agomez test drug | `false` | Augusta, Maine | No |

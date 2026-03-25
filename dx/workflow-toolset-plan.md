@@ -12,10 +12,10 @@ Design for a Claude Code toolset (skills + agents) that standardizes the daily d
 
 ```
 /plan MLID-XXXX     → investigate, plan, approve
-/implement          → write code + tests (TDD)
+/implement MLID-XXXX → write code + tests (TDD)
   ↕ user tests UI, asks questions, queries MongoDB
-/verify             → quality gate before wrap-up
-/wrap-up            → merge, PR, update tracking
+/verify MLID-XXXX   → quality gate before wrap-up
+/wrap-up MLID-XXXX  → merge, PR, update tracking
 ```
 
 ---
@@ -48,13 +48,13 @@ Design for a Claude Code toolset (skills + agents) that standardizes the daily d
 
 ---
 
-### 2. `/implement`
+### 2. `/implement MLID-XXXX`
 
 **Phase:** Implementation (Steps 6-7)
 
 **What it does:**
 
-1. Reads the approved plan file from `docs/agomez/plans/`
+1. Reads the approved plan file from `docs/agomez/plans/` (matched by `MLID-XXXX`)
 2. Creates the feature branch (following branch strategy)
 3. Executes TDD red-green-refactor cycles **inline** (user can watch)
 4. Runs tests after each cycle
@@ -72,13 +72,14 @@ Design for a Claude Code toolset (skills + agents) that standardizes the daily d
 
 ---
 
-### 3. `/verify`
+### 3. `/verify MLID-XXXX`
 
 **Phase:** Quality Gate (Step 8)
 
 **What it does:**
 
-1. Identifies changed files vs base branch
+1. Uses `MLID-XXXX` to identify the feature branch and base branch
+2. Identifies changed files vs base branch
 2. Runs tests on changed files only
 3. Runs `types:check`
 4. Runs prettier on changed files only (not whole repo)
@@ -98,13 +99,14 @@ Design for a Claude Code toolset (skills + agents) that standardizes the daily d
 
 ---
 
-### 4. `/wrap-up`
+### 4. `/wrap-up MLID-XXXX`
 
 **Phase:** Delivery (Steps 9-10)
 
 **What it does:**
 
-1. Determines if task is standalone or epic sub-task
+1. Uses `MLID-XXXX` to locate plan file, branch, and Jira ticket
+2. Determines if task is standalone or epic sub-task
 2. **If epic sub-task:**
    - Merges feature branch into epic branch
    - Updates plan-progress tracking table
@@ -171,16 +173,100 @@ Given a feature description or Jira context, investigates:
 
 **Purpose:** Given the investigator's findings + Jira requirements, designs a structured implementation plan. Reasoning through alternatives and trade-offs happens in isolation — only the final plan is surfaced.
 
-**What it does:**
+#### Design Philosophy: Stack-Aware, Best-Practice-Driven
+
+The solution architect is **not** a pattern-copier. The existing codebase contains both good and bad practices — legacy code, inconsistent patterns, and shortcuts that accumulated over time. The agent must **not** learn "how to code" from the codebase.
+
+Instead, the agent operates as a **senior engineer who brings industry best practices to the team**, constrained only by the tech stack already in use. The codebase analysis (from the investigator) tells the agent **what tools are on the workbench** — the agent decides **how to use them correctly**.
+
+**What the agent learns from the codebase:**
+- The tech stack (what libraries, frameworks, and tools are available)
+- File locations (where things live in the directory structure)
+- Integration points (what existing code it needs to interface with)
+- Data shapes (existing models, DTOs, API contracts it must respect)
+
+**What the agent does NOT learn from the codebase:**
+- Code style or quality patterns — it applies its own standards
+- Architecture decisions — it evaluates from first principles
+- Testing approaches — it follows TDD best practices, not existing test shortcuts
+- Error handling — it applies proper patterns regardless of what exists
+
+#### Tech Stack (What the Agent Works With)
+
+| Layer | Tech |
+|-------|------|
+| Framework | Next.js 14 (App Router) |
+| UI | React 18, TypeScript (strict) |
+| Styling | CSS Modules, MUI components + `sx` props |
+| Forms | React Hook Form (`useForm`, `Controller`) |
+| Database | MongoDB with Mongoose ODM (raw driver is legacy — never use for new code) |
+| Auth | NextAuth with Google OAuth |
+| RBAC | Role + Position-based, dual enforcement (API + UI) |
+| Feature flags | MongoDB-backed, enum-defined (`FeatureFlag`) |
+| Logging | Custom logger (Application Insights), never `console` |
+| Testing | Jest, React Testing Library, TDD mandatory |
+| Job processing | Pulse (Agenda fork) |
+| Real-time | Socket.IO |
+
+#### Engineering Standards the Agent Enforces
+
+**TypeScript:**
+- Strict mode, no `any` — use `unknown` + type guards when type is uncertain
+- Discriminated unions over optional fields for variant types
+- Exhaustive switch/case with `never` for compile-time safety
+- Proper generics over type assertions
+
+**React:**
+- Single responsibility per component
+- Composition over prop drilling — use render props, children, or context where appropriate
+- Custom hooks to encapsulate stateful logic — components should be thin
+- Memoization only when profiling justifies it, not by default
+
+**API Design:**
+- Consistent auth → permission → validate → execute → respond pipeline
+- Input validation at the boundary (API route), trust internal code
+- Proper HTTP status codes: 400 (bad input), 401 (no auth), 403 (no permission), 404 (not found), 500 (unexpected)
+- Error responses that are safe for production (no stack traces, no internal details)
+
+**Mongoose / Database:**
+- Lean queries (`.lean()`) for read operations
+- Explicit field selection when full documents aren't needed
+- Aggregation pipelines via Mongoose model `.aggregate()`
+- Index-aware query design — don't design queries that require full collection scans
+- Soft delete pattern: `deletedAt` field
+
+**Testing (TDD):**
+- Tests describe behavior, not implementation ("should return 403 when user lacks permission", not "should call checkRole")
+- Arrange-Act-Assert structure
+- One assertion per logical concept (multiple `expect` calls are fine if testing one behavior)
+- Mock at boundaries (database, external services), not internal functions
+- Every code path tested: happy path, error paths, edge cases, authorization
+
+**Security:**
+- RBAC enforced at both API and UI levels — never UI-only
+- Feature flags gated at both server (API route) and client (page)
+- Input sanitization at API boundaries
+- PHI awareness — no sensitive data in logs, error messages, or client responses
+- No secrets in code — environment variables or Key Vault
+
+**Code Organization:**
+- Files do one thing — avoid god-files
+- Co-locate tests with source
+- Named exports (no default exports)
+- Absolute imports (`@/...`)
+
+#### What It Does
 
 1. Receives: Jira ticket details + codebase investigation summary
-2. Designs the implementation approach
-3. Identifies files to create/modify
+2. Designs the implementation approach using best practices for the stack
+3. Identifies files to create/modify, specifying the correct layer and responsibility
 4. Defines the TDD test strategy (what to test, in what order)
 5. Considers security, permissions, feature flags
 6. Writes the plan file using the appropriate template
 
-**Returns:** A plan file written to `docs/agomez/plans/` containing:
+#### Returns
+
+A plan file written to `docs/agomez/plans/` containing:
 
 - Task overview and acceptance criteria
 - Implementation steps in order
@@ -197,13 +283,13 @@ Given a feature description or Jira context, investigates:
 
 | Item | Location | Scope |
 |------|----------|-------|
-| Skills | `.claude/skills/<name>/SKILL.md` | Project-scoped |
-| Agents | `~/.claude/agents/<name>/agent.md` | User-scoped (reusable across repos) |
+| Skills | `~/.claude/skills/<name>/SKILL.md` | User-scoped (reusable across repos, not shared with team) |
+| Agents | `~/.claude/agents/<name>.md` | User-scoped (reusable across repos, not shared with team) |
 
 ### Skill files to create
 
 ```
-.claude/skills/
+~/.claude/skills/
 ├── plan/
 │   └── SKILL.md
 ├── implement/
@@ -218,10 +304,8 @@ Given a feature description or Jira context, investigates:
 
 ```
 ~/.claude/agents/
-├── codebase-investigator/
-│   └── agent.md
-└── solution-architect/
-    └── agent.md
+├── codebase-investigator.md
+└── solution-architect.md
 ```
 
 ---
@@ -266,7 +350,7 @@ Steps 5-6 can be built in parallel.
 
 ## Open Questions
 
-- [ ] Should `/implement` auto-read the most recent plan file, or require the user to specify which plan?
-- [ ] Should `/verify` auto-detect the base branch (develop vs epic branch), or require it as argument?
+- [x] ~~Should `/implement` auto-read the most recent plan file, or require the user to specify which plan?~~ **Resolved:** All skills take `MLID-XXXX` — plan file is located by task ID.
+- [x] ~~Should `/verify` auto-detect the base branch (develop vs epic branch), or require it as argument?~~ **Resolved:** Task ID is passed; base branch can be inferred from the plan file or branch naming convention.
 - [ ] Should `/wrap-up` auto-create the PR, or just generate the PR doc and let the user create it?
 - [ ] Should agents preload any skills for additional context (e.g., coding conventions)?
