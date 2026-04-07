@@ -163,3 +163,17 @@ Key findings from the investigation:
 1. **Archival timing in production**: The existing archival has a 2-second `setTimeout` delay between posting the internal note and archiving. This is inherited from the REMINDER implementation. Is this delay sufficient for SYMPTOM messages, or should it be configurable?
 2. **Existing patients with old symptom messages**: Patients who already received the old symptom text on their first appointment will now receive the new checkout text on subsequent completed appointments. Is this the intended behavior, or should there be any migration/cleanup of old messages?
 3. ~~**Feature flag rollout order**~~: No longer applicable — reusing existing `SPRUCE_SMS_REMINDER_*` flags that are already deployed and toggled in production.
+
+
+## Last minute update:
+
+New text:
+
+```
+Thank you for visiting Local Infusion! If you have any symptoms or questions, please contact us and we’ll follow up. For urgent concerns, contact your provider or call 911.
+
+You can find discharge instructions here: 
+https://tinyurl.com/2dh2ahjw
+
+We hope you're doing well! :)
+```

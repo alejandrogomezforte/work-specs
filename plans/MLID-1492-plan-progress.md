@@ -401,7 +401,7 @@ Extends the 340B Eligible column to the Maintenance Orders table. Reuses the exi
 
 | Task ID | Jira | Summary | SP | Status | Branch | Merged to Epic | Notes |
 |---------|------|---------|----|--------|--------|----------------|-------|
-| D3 | MLID-1975 | Add 340B column to Maintenance table | 3 | To Do | feature/MLID-1975-340b-maintenance-column | No | |
+| D3 | MLID-1975 | Add 340B column to Maintenance table | 3 | Done | feature/MLID-1975-340b-maintenance-column | N/A (standalone PR to develop) | Commit ebed00ed |
 
 ### D3: 340B on Maintenance (3 SP)
 

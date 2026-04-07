@@ -203,14 +203,124 @@ curl -X POST http://localhost:8080/api/jobs/trigger \
   -d '{"name": "appointmentReminder", "data": {"force": true}}'
 ```
 
-**Send an appointment webhook** (replace token with your local value):
+**Send an appointment webhook (two-step process)**
 
+The webhook code only schedules a symptom message on the **update path** when the appointment transitions from `Active` or `Rescheduled` to `Complete`. Creating directly with `Complete` hits the insert path which may not work as expected in all scenarios. To reliably test, send two requests:
+
+**Step 1 --- Create the appointment with status `Active`**:
+
+Local:
 ```bash
 curl -X POST http://localhost:8080/api/webhooks/looker_appointments \
   -H "Content-Type: application/json" \
   -H "x-looker-webhook-token: YOUR_TOKEN_HERE" \
-  -d '[{ ... appointment payload ... }]'
+  -d '{
+    "data": [
+      {
+        "appointments.id": "99999904",
+        "locations.id": "1229",
+        "appointments.status": "Active",
+        "orders.patient_id": "1114595",
+        "group_providers.npi": "1366776007",
+        "appointments.start_local_tz_time": "2026-04-05 10:30:00",
+        "orders.created_date_reformat": "2026-03-12",
+        "patients.mobile_phone": "9176755175",
+        "patients.home_phone": "9176755175",
+        "appointments.created_date": "2026-04-06",
+        "appointments.order_series_id": 1453117,
+        "appointments.first_appt_on_order_series": "No",
+        "orders.first_listed_primary_med": "Entyvio"
+      }
+    ]
+  }'
 ```
+
+Staging:
+```bash
+curl -X POST https://app-stage.mylocalinfusion.ai/api/webhooks/looker_appointments \
+  -H "Content-Type: application/json" \
+  -H "x-looker-webhook-token: YOUR_TOKEN_HERE" \
+  -d '{
+    "data": [
+      {
+        "appointments.id": "99999904",
+        "locations.id": "1229",
+        "appointments.status": "Active",
+        "orders.patient_id": "1114595",
+        "group_providers.npi": "1366776007",
+        "appointments.start_local_tz_time": "2026-04-05 10:30:00",
+        "orders.created_date_reformat": "2026-03-12",
+        "patients.mobile_phone": "9176755175",
+        "patients.home_phone": "9176755175",
+        "appointments.created_date": "2026-04-06",
+        "appointments.order_series_id": 1453117,
+        "appointments.first_appt_on_order_series": "No",
+        "orders.first_listed_primary_med": "Entyvio"
+      }
+    ]
+  }'
+```
+
+**Step 2 --- Update the appointment to `Complete`** (same payload, only status changes):
+
+Local:
+```bash
+curl -X POST http://localhost:8080/api/webhooks/looker_appointments \
+  -H "Content-Type: application/json" \
+  -H "x-looker-webhook-token: YOUR_TOKEN_HERE" \
+  -d '{
+    "data": [
+      {
+        "appointments.id": "99999904",
+        "locations.id": "1229",
+        "appointments.status": "Complete",
+        "orders.patient_id": "1114595",
+        "group_providers.npi": "1366776007",
+        "appointments.start_local_tz_time": "2026-04-05 10:30:00",
+        "orders.created_date_reformat": "2026-03-12",
+        "patients.mobile_phone": "9176755175",
+        "patients.home_phone": "9176755175",
+        "appointments.created_date": "2026-04-06",
+        "appointments.order_series_id": 1453117,
+        "appointments.first_appt_on_order_series": "No",
+        "orders.first_listed_primary_med": "Entyvio"
+      }
+    ]
+  }'
+```
+
+Staging:
+```bash
+curl -X POST https://app-stage.mylocalinfusion.ai/api/webhooks/looker_appointments \
+  -H "Content-Type: application/json" \
+  -H "x-looker-webhook-token: YOUR_TOKEN_HERE" \
+  -d '{
+    "data": [
+      {
+        "appointments.id": "99999904",
+        "locations.id": "1229",
+        "appointments.status": "Complete",
+        "orders.patient_id": "1114595",
+        "group_providers.npi": "1366776007",
+        "appointments.start_local_tz_time": "2026-04-05 10:30:00",
+        "orders.created_date_reformat": "2026-03-12",
+        "patients.mobile_phone": "9176755175",
+        "patients.home_phone": "9176755175",
+        "appointments.created_date": "2026-04-06",
+        "appointments.order_series_id": 1453117,
+        "appointments.first_appt_on_order_series": "No",
+        "orders.first_listed_primary_med": "Entyvio"
+      }
+    ]
+  }'
+```
+
+**Notes**:
+- Uses `we_infuse_id: 99999904` (unique) --- use a different ID for each test run
+- Patient `1114595` must exist in the `patients` collection with a matching `we_infuse_id_IV`
+- Only the `Active` → `Complete` (or `Rescheduled` → `Complete`) transition triggers symptom message scheduling on the update path
+- `first_appt_on_order_series: "No"` --- tests that the message is created regardless (guards removed)
+- After Step 2, verify a `Message` doc was created in the `messages` collection with `source: "symptom"` and `appointmentId` matching the new appointment
 
 ### Important Notes
 
@@ -276,3 +386,54 @@ curl -X POST http://localhost:8080/api/jobs/trigger \
 ```
 
 No `force: true` needed --- the job doesn't use a `force` flag. Work hours and feature flags still apply.
+
+---
+
+## 6. Viewing Worker Logs in Azure (Staging)
+
+The background job worker runs as a separate Azure Container App: **`li-stage-local-infusion-worker`**.
+
+### Azure Container Apps mapping
+
+| Container App | Role |
+|---|---|
+| `li-stage-local-infusion-app` | Next.js web app (port 8080) |
+| `li-stage-local-infusion-worker` | Background job worker (`worker.ts`) --- runs Pulse jobs |
+| `li-stage-li-public-api` | NestJS public API (`apps/api`) |
+| `li-stage-li-mcp-server` | MCP server (`apps/mcp`) |
+
+### How to access logs
+
+1. Go to **Azure Portal > Container Apps** and open **`li-stage-local-infusion-worker`**
+2. In the left sidebar, expand **Monitoring**:
+   - **Log stream** --- live/recent container logs (best for quick checks)
+   - **Logs** --- query-based historical log search using KQL (Kusto Query Language), powered by the `li-stage-law` Log Analytics workspace
+
+### Example KQL queries
+
+**Search for symptom message scheduling logs**:
+
+```kql
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "li-stage-local-infusion-worker"
+| where Log_s contains "setSymptomMessage" or Log_s contains "sendMessageProcessing"
+| order by TimeGenerated desc
+| take 50
+```
+
+**Search for webhook appointment upsert logs**:
+
+```kql
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "li-stage-local-infusion-worker"
+| where Log_s contains "webhookUpsertAppointments"
+| order by TimeGenerated desc
+| take 50
+```
+
+**Note**: Webhook requests hit `li-stage-local-infusion-app` (the web app), not the worker. If you need to see webhook request logs, query that container instead.
+
+
+**Note**: Olha's notes on how to test:
+https://localinfusion.atlassian.net/wiki/spaces/~712020909b704a65004740ba34f964e4c65794/pages/31653904/Appointment+reminder+API+for+stage+env.
+
