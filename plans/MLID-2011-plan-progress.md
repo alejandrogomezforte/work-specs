@@ -18,7 +18,7 @@ Provide real-time visibility to Infusion Guides when new documents are added to 
 
 **Azure SignalR Service** — The messaging layer will be built using Azure SignalR Service. The previous plan to use raw Socket.IO was rejected due to the complexity of orchestrating WebSockets in Azure infrastructure. Azure SignalR provides a managed real-time broadcast service that handles scaling, connection management, and Azure-native integration out of the box.
 
-**SignalR is a 3rd-party service the webapp integrates with** — like Spruce or WeInfuse. The webapp is the SignalR client, not individual users. Connection string / API token stored in Azure Key Vault. No per-user authentication to SignalR. The server broadcasts events to all connected browsers; each browser decides if the event is relevant to its current view.
+**SignalR is a 3rd-party service the webapp integrates with** — like Spruce or WeInfuse. Connection string stored in Azure Key Vault. Per-user JWT tokens issued via `POST /api/signalr/negotiate`. The server broadcasts events to all connected browsers; each browser decides if the event is relevant to its current view.
 
 This epic builds a **reusable SignalR integration** for real-time broadcast, then uses it to deliver document notifications. The SignalR layer is generic — future features (intakes, location changes, etc.) can reuse it to broadcast events to all connected clients.
 
@@ -53,44 +53,215 @@ This epic builds a **reusable SignalR integration** for real-time broadcast, the
 
 - **App-level integration** — SignalR is a 3rd-party service. The webapp authenticates to SignalR using a connection string stored in Azure Key Vault. Individual users do NOT authenticate to SignalR.
 - **Rooms as topic channels** — Rooms are used to categorize broadcasts by feature area (like logging categories). This epic uses a room called `orders`. Clients viewing order-related pages join the `orders` room and only receive order-related events. Future features (intakes, locations, etc.) get their own rooms.
-- **Notifications are transient** — Fire and forget. Nothing persisted. Source of truth is always MongoDB (the `documents` collection).
+- **Notifications are persisted** — The `notifications` collection stores notification state. SignalR broadcasts are transient (fire and forget) — they just trigger clients to re-fetch from MongoDB.
 - **Client SDK** — `@microsoft/signalr` npm package. Handles transport negotiation (WebSocket → SSE → Long Polling), auto-reconnection, and connection lifecycle.
-- **Hub** — Single hub named `notifications`. Generic — reusable for any future real-time broadcast needs.
-- **Connection string** — Stored in Azure Key Vault (secret name TBD by Anatoliy), accessed via existing Key Vault integration. Local dev uses `DEV_SECRET_` fallback.
+- **Hub** — Single hub named `li-hub`. Generic — reusable for any future real-time broadcast needs.
+- **Connection string** — Stored in Azure Key Vault (secret name: `signalr-primary-connection-string`, env override: `SIGNALR_KV_SECRET_NAME`).
+- **Auth model** — Per-user JWT tokens. Each browser client calls `POST /api/signalr/negotiate` to get a `{ url, accessToken }` pair, then connects to SignalR with that token.
 - **Existing Socket.IO** — Coexists. Call-status events (`callStatusChanged`, `globalCallStatusChanged`) remain on Socket.IO. No migration in this epic.
 
 ---
 
-## Document Acknowledgement: `acknowledged` flag on Document model
+## Notification Data Model (PE Implementation)
 
-**No new collections.** The acknowledgement state lives directly on the existing `documents` collection as a simple boolean flag. When any user clicks "Mark as Read", the document is marked as acknowledged globally.
+The Principal Engineer implemented the notification data model in branch `feature/MLID-2011-notifications-data-model`. This is the **canonical model** — all epic work builds on it.
 
-### Schema change on `documents` collection
+### Two Collections
+
+#### `Notification` model (`models/Notification.ts`)
+
+One document per event. Shared across users — not duplicated per recipient.
 
 ```typescript
-// New fields added to IDocument interface and DocumentSchema
-{
-  acknowledged: boolean;      // default: false — has anyone marked this as read?
-  acknowledgedAt?: Date;      // when it was acknowledged
-  acknowledgedBy?: string;    // userId who acknowledged it (audit trail)
+type NotificationType = 'task' | 'user';
+type NotificationPriority = 'low' | 'normal' | 'high';
+
+interface INotificationEntity {
+  entityType: string;   // domain name: 'order', 'document', 'patient', 'appointment', 'clinical-review', etc.
+  entityId: string;     // document _id reference
+}
+
+interface INotification extends Document {
+  // _id inherited from Document as ObjectId (not overridden)
+  title: string;                       // short display title
+  message: string;                     // notification body
+  type: NotificationType;              // determines read tracking behavior (see below)
+  priority: NotificationPriority;      // 'low' | 'normal' | 'high', default: 'normal'
+  targetUserId: string | null;         // target a specific user (at least one target required)
+  targetLocationId: string | null;     // target all users assigned to this location
+  targetRole: string | null;           // target all users with this role
+  entities: INotificationEntity[];     // linked entities — polymorphic, multiple allowed
+  isRead: boolean;                     // default: false — only meaningful for 'task' type
+  readBy: string | null;               // userId who acknowledged it — only meaningful for 'task' type
+  readAt: Date | null;                 // when acknowledged — only meaningful for 'task' type
+  expiresAt: Date | null;              // optional expiration (sparse index, NOT TTL — no auto-deletion)
+  createdAt: Date;                     // auto (timestamps: true)
+  updatedAt: Date;                     // auto (timestamps: true)
+  createdBy: string;                   // userId or 'system'
 }
 ```
 
-### How it drives the UI
+**Validation:** A `pre('validate')` hook enforces that at least one of `targetUserId`, `targetLocationId`, or `targetRole` must be set. Creating a notification with all three as `null` will throw a validation error.
 
-| UI Element | Query |
-|---|---|
-| "New" tag on document row | `document.acknowledged === false` |
-| "Mark as Read" button shown | `document.acknowledged === false` |
-| Documents tab badge (unread count) | `count(documents where patientId=X AND acknowledged=false)` |
-| Order Tracker badge | Same count, aggregated per order via patient link |
-| "Mark all as Read" | `updateMany({ patientId, acknowledged: false }, { acknowledged: true, acknowledgedAt, acknowledgedBy })` |
+**Targeting** uses OR logic: a notification matches a user if **at least one** of the targeting criteria is satisfied:
+- `targetUserId === user.id` OR
+- `targetLocationId IN user.locations` (user can belong to multiple locations, matched via `$in`) OR
+- `targetRole === user.role`
 
-### Why this works
+**Read tracking** differs by type:
 
-- **Simple** — no new collection, no per-user state, no notification persistence
-- **Generic** — if future features need acknowledgement (intakes, etc.), same pattern: add a flag to the domain entity
-- **Source of truth** — the document IS the state. UI reads from existing collections. SignalR just says "hey, go re-check."
+- `type: 'task'` — **Actionable items that any team member can acknowledge.** Read state tracked **inline** on the notification itself (`isRead`, `readBy`, `readAt`). Once **anyone** marks it as read, it's read for **everyone** in the target group. Example: a new fax arrives for an order → notification targets all users at the clinic location → the first user to review it clicks "Acknowledge" → notification clears for the entire team.
+
+- `type: 'user'` — **Informational notifications where each user independently tracks their own read state.** Read state tracked in a **separate `NotificationRead` collection**. One user marking it read does **not** affect others. Example: "You have been assigned to order #456" → each user has their own read receipt.
+
+#### `NotificationRead` model (`models/NotificationRead.ts`)
+
+Per-user read tracking for `user`-type notifications. One document per user per notification. Each record means "this user has read this notification."
+
+```typescript
+interface INotificationRead extends Document {
+  // _id inherited from Document as ObjectId (not overridden)
+  notificationId: ObjectId;   // ref -> notifications._id
+  userId: string;             // who read it
+  readAt: Date;               // when they read it (default: Date.now)
+}
+```
+
+Unique index on `(notificationId, userId)` — one read receipt per user per notification.
+
+### Indexes
+
+**`notifications` collection:**
+
+| Index | Purpose |
+|-------|---------|
+| `{ targetUserId: 1, createdAt: -1 }` | User's notifications, newest first |
+| `{ targetLocationId: 1, createdAt: -1 }` | Location-scoped notifications |
+| `{ targetRole: 1, createdAt: -1 }` | Role-scoped notifications |
+| `{ "entities.entityType": 1, "entities.entityId": 1 }` | All notifications for a specific entity |
+| `{ expiresAt: 1 }` (sparse) | Query index for expiration filtering (NOT a TTL index — no auto-deletion by design) |
+
+**`notificationreads` collection:**
+
+| Index | Purpose |
+|-------|---------|
+| `{ notificationId: 1, userId: 1 }` (unique) | One read receipt per user per notification |
+| `{ userId: 1 }` | "What has this user read?" |
+
+### Service Layer (`services/mongodb/notification.ts`)
+
+| Function | Purpose |
+|----------|---------|
+| `createNotification(data)` | Create a notification (validated: at least one target field required) |
+| `getNotificationsForUser({ userId, locationIds, role })` | Get notifications matching user OR location OR role, paginated (default: limit 50, offset 0), sorted newest first. Excludes expired notifications. |
+| `getUnreadCountForUser({ userId, locationIds, role })` | Count unread across both types via `$facet` aggregation (task: `isRead=false`, user: `$lookup` against `notificationreads` with `$size: 0`). Excludes expired notifications. |
+| `getCountForEntity({ entityType, entityId, ..., unreadOnly? })` | Count notifications for a specific entity (e.g., all for orderId X). When `unreadOnly: true`, uses same `$facet` pattern as `getUnreadCountForUser`. Excludes expired notifications. |
+| `markTaskAsRead(notificationId, userId)` | Flip `isRead=true`, set `readBy` and `readAt` via `findOneAndUpdate` with `type: 'task'` guard — returns `null` if called on a `user`-type notification (prevents corruption) |
+| `markUserNotificationAsRead(notificationId, userId)` | Insert a `NotificationRead` record (idempotent — silently ignores duplicate key error 11000) |
+| `bulkMarkUserNotificationsAsRead(notificationIds, userId)` | Batch insert `NotificationRead` records via `insertMany({ ordered: false })` (handles both `MongoBulkWriteError` and error code 11000 for duplicates) |
+| `isReadByUser(notificationId, userId)` | Check if a `NotificationRead` record exists for this user+notification |
+
+### Entity Linking
+
+Notifications can link to one or more entities. This enables queries like "show me all notifications for this order" or "how many unread notifications does this patient have?"
+
+```typescript
+entities: [
+  { entityType: 'order', entityId: '6612a1b2c3d4e5f6a7b8c9d0' },
+  { entityType: 'document', entityId: '6612a1b2c3d4e5f6a7b8c9d1' },
+]
+```
+
+**Supported entity types** (open-ended, no enum constraint): `order`, `document`, `patient`, `appointment`, `clinical-review`, and any future entity type — no schema changes needed.
+
+### SignalR Layer (PE Implementation — separate PR, not in data model PR)
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Server-side service | `services/signalr/index.ts` | Parse connection string from Key Vault, generate JWT tokens, `negotiate()` for clients, `generateServerToken()` for server→SignalR API |
+| Negotiate API route | `app/api/signalr/negotiate/route.ts` | POST, authenticated. Returns `{ url, accessToken }` for client SDK |
+| React context | `utils/context/signalr-context.tsx` | `SignalRProvider` + `useSignalR()` hook. Auto-reconnect. Exposes `connection` and `isConnected` |
+
+**Key details:**
+- Hub name: `li-hub`
+- Auth model: **per-user JWT tokens** via negotiate endpoint
+- Key Vault secret: `signalr-primary-connection-string` (env override: `SIGNALR_KV_SECRET_NAME`)
+
+### Notification Type Semantics (Resolved)
+
+The PE's data model defines two notification types with distinct read-tracking behaviors:
+
+| Type | Use Case | Read Tracking | Mutation | Example |
+|------|----------|---------------|----------|---------|
+| `task` | Actionable items that **any** team member can acknowledge | **Inline** on the notification: `isRead`, `readBy`, `readAt`. Once anyone marks it read, it's read for **everyone**. | `markTaskAsRead(notificationId, userId)` | New fax arrives for order → targets clinic location → first user to review clicks "Acknowledge" → clears for entire team |
+| `user` | Informational notifications where **each user** independently tracks read state | **Separate collection** `notificationreads`. Each user has their own read receipt — one user marking it read does **not** affect others. | `markUserNotificationAsRead(notificationId, userId)` or `bulkMarkUserNotificationsAsRead(ids, userId)` | "You have been assigned to order #456" → each user sees/dismisses independently |
+
+### Document Notification Type Decision (Updated 2026-04-07)
+
+**Requirement:** Only the user **assigned to** the order can view and acknowledge documents — both at document level and at "all documents" level.
+
+**Decision:** Document notifications use **`user` type** with `targetUserId` set to the order's assigned user. This replaces the previous `task` type / `targetLocationId` approach.
+
+- **No `acknowledged` flag on documents** — badge counts driven entirely from `Notification` + `NotificationRead` queries.
+- **No document model changes needed.**
+
+### Scenario 1: Document Added to Order
+
+1. Document saved to MongoDB
+2. Create `user` notification — targeted to `targetUserId` (order's assigned user):
+   ```typescript
+   createNotification({
+     type: 'user',
+     targetUserId: order.assignedTo,
+     entities: [
+       { entityType: 'order', entityId: orderId },
+       { entityType: 'document', entityId: documentId },
+     ],
+     createdBy: 'system',
+   })
+   ```
+3. SignalR broadcast to all connected clients → assigned user's client re-fetches badge counts
+
+### Scenario 2: Document Marked as Read (single)
+
+1. Call `markUserNotificationAsRead(notificationId, userId)` — inserts a `NotificationRead` record (idempotent).
+2. SignalR broadcast to all connected clients → badge counts update
+
+### Scenario 3: All Documents Marked as Read (bulk)
+
+1. Query unread notification IDs for the order, then call `bulkMarkUserNotificationsAsRead(notificationIds, userId)`.
+2. SignalR broadcast → badge counts update
+
+### What's Already Built
+
+**PR #1049 — Data Model** (`feature/MLID-2011-notifications-data-model`):
+
+| Component | Status |
+|-----------|--------|
+| `Notification` Mongoose model + schema + indexes + target validation | Done |
+| `NotificationRead` Mongoose model + schema + indexes | Done |
+| Notification service (CRUD, counts, mark read) + tests (33 service + 4 model = 37 tests) | Done |
+| PR review fixes: type guard on `markTaskAsRead`, `MongoBulkWriteError` handling, expiry filtering, `_id` type fix, target validation | Done |
+
+**Separate PE work — SignalR layer** (not in PR #1049, expected in a future PR):
+
+| Component | Status |
+|-----------|--------|
+| SignalR server-side service (negotiate, token generation) | Done (PE, separate branch/PR) |
+| SignalR negotiate API route | Done (PE, separate branch/PR) |
+| SignalR React context + `useSignalR()` hook | Done (PE, separate branch/PR) |
+| `@microsoft/signalr` client SDK dependency | Done (PE, separate branch/PR) |
+
+### What's Still Needed
+
+| Component | Status |
+|-----------|--------|
+| ~~`acknowledged` flag on Document model~~ | **Not needed** — badge counts driven entirely from `Notification` + `NotificationRead` queries |
+| Notification API routes (`GET /notifications`, `PATCH /notifications/:id/read`) | Still needed (D2-T1) — uses `markUserNotificationAsRead()` |
+| SignalR server-side **broadcast** function (send event to all/group) | Still needed (D1-T1) — PE built negotiate/token but not `broadcastToRoom()` |
+| Document creation triggers (webhook/upload → create notification + broadcast) | Still needed (D2-T2) |
+| Feature flag `ORDER_DOCUMENT_NOTIFICATIONS` | Still needed (D1-T1) |
+| UI components (badges, "New" tags, "Mark as Read") | Still needed (D3) |
 
 ---
 
@@ -98,10 +269,10 @@ This epic builds a **reusable SignalR integration** for real-time broadcast, the
 
 ### Core Principles
 
-1. **SignalR = transient push alerts** — Fire and forget. No persistence. Just tells connected clients "something changed, re-fetch if relevant."
-2. **Existing collections = source of truth** — `documents.acknowledged` drives the UI state. No notifications collection.
-3. **REST for mutations** — "Mark as Read" calls existing document API routes to flip `acknowledged: true`. SignalR broadcasts the change.
-4. **Feature-flag gated** — `DOCUMENT_NOTIFICATIONS` flag gates everything at API + UI level.
+1. **SignalR = transient push alerts** — Fire and forget. No persistence. Tells all connected clients "something changed, re-fetch."
+2. **`notifications` + `notificationreads` collections = source of truth** — Notification state lives in `Notification` model, per-user read state in `NotificationRead` collection. No flags on the `documents` collection.
+3. **REST for mutations** — "Mark as Read" calls API routes that insert `NotificationRead` records via `markUserNotificationAsRead()`. SignalR broadcasts the change to all clients.
+4. **Feature-flag gated** — `ORDER_DOCUMENT_NOTIFICATIONS` flag gates everything at API + UI level.
 
 ### Layer Diagram
 
@@ -137,31 +308,35 @@ This epic builds a **reusable SignalR integration** for real-time broadcast, the
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  API Routes (REST) — existing + new                     │    │
-│  │  PATCH /api/documents/:id/acknowledge  — mark one read  │    │
-│  │  PATCH /api/documents/acknowledge-bulk — mark all read  │    │
-│  │  GET  /api/orders/details              — already exists  │    │
+│  │  POST  /api/signalr/negotiate          — PE built       │    │
+│  │  GET   /api/notifications              — user's notifs  │    │
+│  │  PATCH /api/notifications/:id/read     — mark read      │    │
+│  │  GET   /api/orders/details             — already exists  │    │
 │  └──────────────────────┬──────────────────────────────────┘    │
 │                         │ calls                                 │
 │  ┌──────────────────────▼──────────────────────────────────┐    │
-│  │  SignalR Broadcast Service (services/signalr/)          │    │
-│  │  - Generic: broadcastToRoom(room, event, payload)       │    │
-│  │  - Authenticates using connection string from Key Vault │    │
-│  │  - Calls SignalR REST API to broadcast to a room        │    │
-│  │  - Rooms = topic channels (e.g., 'orders', 'intakes')  │    │
+│  │  SignalR Service (services/signalr/) — PE built         │    │
+│  │  - negotiate(userId) → { url, accessToken }             │    │
+│  │  - generateServerToken() for server→SignalR API         │    │
+│  │  - Connection string from Key Vault                     │    │
+│  │  - broadcastToRoom() / sendToAll() — not yet built (D1-T1) │  │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  Document Triggers (entry points)                       │    │
 │  │  - Document webhook handlers                            │    │
 │  │  - Document upload routes                               │    │
-│  │  - On document creation: broadcast 'documentAdded'      │    │
-│  │  - On acknowledge: broadcast 'documentAcknowledged'     │    │
+│  │  - On creation: create user notification + broadcast    │    │
+│  │  - On mark read: insert NotificationRead + broadcast    │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │  Document Model (existing, enhanced)                    │    │
-│  │  - Added: acknowledged, acknowledgedAt, acknowledgedBy  │    │
-│  │  - New docs default to acknowledged: false              │    │
+│  │  Notification Model (PE built — Mongoose)               │    │
+│  │  - notifications + notificationreads collections        │    │
+│  │  - Document notifications: type 'user', per-user read   │    │
+│  │    receipts via NotificationRead collection              │    │
+│  │  - Multi-entity linking via entities[] ($elemMatch)     │    │
+│  │  - Targeting: targetUserId (order's assigned user)      │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -172,7 +347,7 @@ This epic builds a **reusable SignalR integration** for real-time broadcast, the
 | Event (target) | Payload | When |
 |-----------------|---------|------|
 | `documentAdded` | `{ documentId, patientId, orderId, category, source }` | New document created/uploaded |
-| `documentAcknowledged` | `{ documentId, patientId }` | Document marked as read |
+| `documentRead` | `{ documentId, orderId, userId }` | Document notification marked as read |
 
 **These are fire-and-forget.** Client receives the event and re-fetches relevant data from existing REST APIs. If the client misses an event (offline), the next page load or API call will have the correct state from MongoDB.
 
@@ -183,60 +358,106 @@ Document uploaded (webhook/upload)
   │
   ▼
 Document Trigger (in webhook handler / upload route)
-  │ 1. Saves document to MongoDB (acknowledged: false)
-  │ 2. Calls signalrClient.broadcastToRoom('orders', 'documentAdded', {
-  │      documentId, patientId, orderId, category, source
-  │    })
+  │ 1. Saves document to MongoDB
+  │ 2. Creates notification via createNotification():
+  │      { title: "New Document Added",
+  │        message: "A new fax has been added to Order #ORD-1234",
+  │        type: 'user',
+  │        targetUserId: order.assignedTo,
+  │        entities: [{ entityType: 'order', entityId },
+  │                    { entityType: 'document', entityId }],
+  │        createdBy: 'system' }
+  │ 3. Broadcasts SignalR event to all connected clients
   │
   ▼
-signalrClient.broadcastToRoom()
-  │ POST https://<instance>.service.signalr.net/api/v1/hubs/notifications/groups/orders
-  │ Body: { "target": "documentAdded", "arguments": [payload] }
+Azure SignalR Service → ALL clients
   │
   ▼
-Azure SignalR Service → all clients in the 'orders' room
-  │
-  ▼
-Client (listening via SignalRContext)
+Assigned user's client (listening via SignalRContext)
   │ connection.on('documentAdded', handler)
-  │ If relevant to current view → re-fetch order details / documents list
-  │ UI updates: badge appears, "New" tag shows on document row
+  │ Re-fetches unread counts from Notification + NotificationRead queries
+  │ UI updates: badge count increments, "New" tag shows on document row
 ```
 
-### Data Flow: Mark as Read
+### Data Flow: Mark as Read (single)
 
 ```
-User clicks "Mark as Read" on a document
+Assigned user clicks "Mark as Read" on a document
   │
   ▼
-PATCH /api/documents/:id/acknowledge
-  │ 1. Updates document: { acknowledged: true, acknowledgedAt, acknowledgedBy }
-  │ 2. Calls signalrClient.broadcastToRoom('orders', 'documentAcknowledged', { documentId, patientId })
+API Route (PATCH /api/notifications/:id/read)
+  │ 1. markUserNotificationAsRead(notificationId, userId)
+  │    — inserts NotificationRead record (idempotent)
+  │ 2. Broadcasts SignalR event to all connected clients
   │
   ▼
-All clients in 'orders' room receive event → re-fetch if on that order's view
-  │ "New" tag disappears, badge count decrements
+Azure SignalR Service → ALL clients
+  │
+  ▼
+Assigned user's client re-fetches unread counts
+  │ Badge count decrements, "New" tag disappears on that document row
 ```
 
-### New File Structure
+### Data Flow: Mark All as Read (bulk)
 
+```
+Assigned user clicks "Mark all as Read" on an order
+  │
+  ▼
+API Route (PATCH /api/notifications/bulk-read)
+  │ 1. Query unread notification IDs for the order
+  │ 2. bulkMarkUserNotificationsAsRead(notificationIds, userId)
+  │    — batch inserts NotificationRead records (skips duplicates)
+  │ 3. Broadcasts SignalR event to all connected clients
+  │
+  ▼
+Azure SignalR Service → ALL clients
+  │
+  ▼
+Assigned user's client re-fetches unread counts
+  │ All badge counts clear, all "New" tags disappear
+```
+
+### File Structure
+
+**Already built by PE — PR #1049** (data model, `feature/MLID-2011-notifications-data-model`):
+```
+apps/web/
+├── models/
+│   ├── Notification.ts               — ✅ Mongoose model + target validation hook
+│   ├── Notification.test.ts          — ✅ Model validation tests (4 tests)
+│   └── NotificationRead.ts           — ✅ Mongoose model (notificationreads collection)
+└── services/
+    └── mongodb/
+        ├── notification.ts           — ✅ Notification service (CRUD, counts, mark read)
+        └── notification.test.ts      — ✅ Service tests (33 tests)
+```
+
+**Already built by PE — separate branch/PR** (SignalR layer):
 ```
 apps/web/
 ├── services/
 │   └── signalr/
-│       └── signalrClient.ts          — Server-side broadcast client (generic, reusable)
-│                                        Uses connection string from Key Vault
-├── types/
-│   └── signalr.ts                    — SignalR event types (generic)
+│       └── index.ts                  — ✅ Server-side service (negotiate, token generation)
 ├── app/api/
-│   └── documents/
-│       ├── [id]/
-│       │   └── acknowledge/
-│       │       └── route.ts          — PATCH: mark one document as read
-│       └── acknowledge-bulk/
-│           └── route.ts              — PATCH: mark all patient docs as read
+│   └── signalr/
+│       └── negotiate/
+│           └── route.ts              — ✅ POST: SignalR negotiate endpoint
 └── utils/context/
-    └── signalr-context.tsx           — SignalR HubConnection provider + hook (generic)
+    └── signalr-context.tsx           — ✅ SignalR React context + useSignalR() hook
+```
+
+**Still needed** (to be built in D1/D2/D3):
+```
+apps/web/
+├── services/
+│   └── signalr/
+│       └── broadcast.ts              — Server-side broadcast function (D1-T1)
+├── app/api/
+│   ├── notifications/
+│   │   └── route.ts                  — GET: list user's notifications (D2-T1)
+│   └── notifications/[id]/read/
+│       └── route.ts                  — PATCH: mark read via markUserNotificationAsRead (D2-T1)
 ```
 
 ---
@@ -247,10 +468,10 @@ apps/web/
 Provision and configure the Azure SignalR Service resource, secrets, and environment configuration. Owned by Anatoliy (Principal Engineer). This is a blocker for all other phases.
 
 ### Phase A: SignalR Integration (foundation)
-Application-level SignalR integration: server-side broadcast client (uses connection string from Key Vault) + client-side SDK context. Generic and reusable — not tied to documents or notifications specifically. No per-user auth to SignalR.
+Application-level SignalR integration. The PE has already built the negotiate service, client context, and notification data model. Remaining work: feature flag + server-side broadcast function (to push events to connected clients).
 
 ### Phase B: Document Notifications (feature)
-Build the document notification experience: `acknowledged` flag on documents, trigger SignalR events on document creation, badges in Order Tracker, acknowledgement flow in Documents tab, audit trail in Order History.
+Build the document notification experience: trigger SignalR events on document creation, create `user`-type notifications targeting the order's assigned user, badges in Order Tracker, "Mark as Read" flow in Documents tab, audit trail in Order History. No document model changes — all state lives in `notifications` + `notificationreads` collections.
 
 ---
 
@@ -281,16 +502,16 @@ Build the document notification experience: `acknowledged` flag on documents, tr
 - CORS allows the app origin in each environment
 - A simple smoke test confirms negotiate → connect → receive message works from Node.js
 
-**Open questions for Anatoliy:**
-1. **Key Vault secret name** — What naming convention should we follow? Suggestion: `azure-signalr-connection-string`. The app code will reference this name to fetch the connection string.
-2. **DEV_SECRET fallback variable name** — Suggestion: `DEV_SECRET_azure_signalr_connection_string` (matching the existing `DEV_SECRET_*` pattern). Confirm or adjust.
+**Open questions for Anatoliy (most resolved by PE implementation):**
+1. ~~**Key Vault secret name**~~ — **Resolved:** `signalr-primary-connection-string` (env override: `SIGNALR_KV_SECRET_NAME`)
+2. ~~**DEV_SECRET fallback variable name**~~ — **Resolved:** Uses `SIGNALR_KV_SECRET_NAME` env var override for local dev
 3. **Pricing tier for staging** — Free tier has limits (20 concurrent connections, 20K messages/day). Is Standard needed for staging, or is Free sufficient for testing?
 4. **Region** — Which Azure region are the existing resources in? The SignalR resource should be co-located.
 5. **Service mode** — We plan to use the service as a broadcast channel (server sends to all clients). What's the recommended mode (Default vs Serverless) for this pattern?
-6. **Existing Socket.IO coexistence** — The app currently uses Socket.IO for call-status events (`callStatusChanged`, `globalCallStatusChanged`). Plan is to keep both running in parallel. Any concerns from an infra perspective?
-7. **Hub naming** — We plan to use a single hub called `notifications`. Is there a naming convention or restriction on the Azure side?
+6. ~~**Existing Socket.IO coexistence**~~ — **Resolved:** Coexists. No migration in this epic.
+7. ~~**Hub naming**~~ — **Resolved:** `li-hub`
 8. **Connection limits** — Standard tier supports 1K concurrent connections per unit. How many concurrent users do we expect in prod? Do we need multiple units?
-9. **Client connection setup** — How should browser clients connect to the SignalR service? The app (not individual users) authenticates to SignalR. Need guidance on the client SDK connection pattern that works with this model.
+9. ~~**Client connection setup**~~ — **Resolved:** Per-user JWT tokens via `POST /api/signalr/negotiate`. Client uses `@microsoft/signalr` SDK with `withAutomaticReconnect()`.
 
 **D0 PR to develop:** Not needed (infrastructure only, no app code)
 
@@ -298,31 +519,31 @@ Build the document notification experience: `acknowledged` flag on documents, tr
 
 ## Deliverable 1: SignalR Integration (Phase A)
 
-**Goal:** Generic, reusable SignalR integration — server-side broadcast client + client-side React context. Testable: call broadcast from server → all connected clients receive the event. Not tied to documents or any specific feature.
+**Goal:** Complete the SignalR integration layer. The PE has already built: negotiate service, negotiate API route, React context + `useSignalR()` hook, `Notification` + `NotificationRead` models, and the full notification service. Remaining: feature flag + server-side broadcast function to push events to connected clients.
 
 **Depends on:** D0 (SignalR resource must be provisioned and connection string available)
 
 | Task ID | Summary | SP | Status | Branch | Merged to Epic | Notes |
 |---------|---------|:--:|:------:|--------|:--------------:|-------|
-| D1-T1 | Feature flag `DOCUMENT_NOTIFICATIONS` + SignalR server-side broadcast client | 3 | To Do | - | - | [MLID-2080](https://localinfusion.atlassian.net/browse/MLID-2080) |
-| D1-T2 | Frontend: SignalR React context + provider (`SignalRContext`) | 3 | To Do | - | - | [MLID-2081](https://localinfusion.atlassian.net/browse/MLID-2081) |
+| D1-T1 | Feature flag `ORDER_DOCUMENT_NOTIFICATIONS` + SignalR server-side broadcast function | 3 | Done | `feature/MLID-2080-signalr-broadcast-feature-flag` | Yes | [MLID-2080](https://localinfusion.atlassian.net/browse/MLID-2080) |
+| D1-T2 | Notification data model (Notification + NotificationRead Mongoose models, notification service) | 3 | Done | `feature/MLID-2011-notifications-data-model` (merged via PR #1049 to epic) | Yes | [MLID-2081](https://localinfusion.atlassian.net/browse/MLID-2081) — Delivered by PE under PR #1049 (referenced as `MLID-2011`, not the sub-task key). SignalR React context + service foundation was separately merged directly to develop via PR #1046 (MLID-2079). |
 
-**D1 PR to develop:** Not yet
+**D1 PR to develop:** Deferred — D1 alone has no user-facing behavior worth QA validation. Will merge to develop as part of D2 PR once notification API routes and document triggers are wired up, giving QA something testable end-to-end.
 
 ---
 
-## Deliverable 2: Document Notifications + Acknowledgement (Phase B)
+## Deliverable 2: Document Notification Wiring (Phase B)
 
-**Goal:** Add `acknowledged` flag to the Document model. Wire document creation entry points to broadcast SignalR events. Add acknowledge API routes. Testable: upload a document → it's saved with `acknowledged: false` → SignalR event fires → calling acknowledge route flips the flag → SignalR event fires again.
+**Goal:** Wire document creation entry points to create notifications (using PE's model) and broadcast SignalR events. Add API routes for reading and acknowledging notifications. Notifications are `user` type targeting the order's assigned user — no document model changes needed.
 
 **Depends on:** D1
 
 | Task ID | Summary | SP | Status | Branch | Merged to Epic | Notes |
 |---------|---------|:--:|:------:|--------|:--------------:|-------|
-| D2-T1 | `acknowledged` flag on Document model + acknowledge API routes | 3 | To Do | - | - | [MLID-2082](https://localinfusion.atlassian.net/browse/MLID-2082) |
-| D2-T2 | Investigate document creation entry points + emit `documentAdded` events | 5 | To Do | - | - | [MLID-2083](https://localinfusion.atlassian.net/browse/MLID-2083) |
+| D2-T1 | Notification API routes (list, mark read via `markUserNotificationAsRead`) | 3 | Done | `feature/MLID-2082-notification-api-routes` | Yes | [MLID-2082](https://localinfusion.atlassian.net/browse/MLID-2082) |
+| D2-T2 | Investigate document creation entry points + create notifications + emit SignalR events | 5 | Done | `feature/MLID-2083-document-notification-triggers` | Yes | [MLID-2083](https://localinfusion.atlassian.net/browse/MLID-2083) |
 
-**D2 PR to develop:** Not yet
+**D2 PR to develop:** Deferred — will ship as a single PR with D3 once the full notification UI is built, giving QA the complete end-to-end feature to test.
 
 ---
 
@@ -336,7 +557,7 @@ Build the document notification experience: `acknowledged` flag on documents, tr
 |---------|---------|:--:|:------:|--------|:--------------:|-------|
 | D3-T1 | Order Tracker: notification badge on Order ID + "Action Required" quick filter | 5 | To Do | - | - | [MLID-2084](https://localinfusion.atlassian.net/browse/MLID-2084) |
 | D3-T2 | Documents Tab: unread badge, "New" tags, "Mark as Read" (single + bulk) | 5 | To Do | - | - | [MLID-2085](https://localinfusion.atlassian.net/browse/MLID-2085) |
-| D3-T3 | Order History: document audit trail entries with source differentiation | 3 | To Do | - | - | [MLID-2086](https://localinfusion.atlassian.net/browse/MLID-2086) |
+| D3-T3 | Order History: document audit trail entries with source differentiation | 3 | To Do | - | - | [MLID-2086](https://localinfusion.atlassian.net/browse/MLID-2086) — **Needs refinement:** clarify how notifications surface in order history (query notifications by entity? separate audit log entry? existing history mechanism?) |
 
 **D3 PR to develop:** Not yet
 
@@ -347,13 +568,13 @@ Build the document notification experience: `acknowledged` flag on documents, tr
 ### D0: Azure SignalR Infrastructure (3 SP) — Anatoliy
 - D0-T1 — MLID-2079 — Provision SignalR resource + Key Vault + CORS + smoke test (3 SP)
 
-### D1: SignalR Integration (6 SP)
-- D1-T1 — MLID-2080 — Feature flag + SignalR server-side broadcast client (3 SP)
-- D1-T2 — MLID-2081 — Frontend: SignalR React context + provider (3 SP)
+### D1: SignalR Integration (3 SP remaining)
+- D1-T1 — MLID-2080 — Feature flag + SignalR server-side broadcast function (3 SP)
+- D1-T2 — MLID-2081 — Frontend: SignalR React context + provider (3 SP) — In Review (PE PR pending)
 
-### D2: Document Notifications + Acknowledgement (8 SP)
-- D2-T1 — MLID-2082 — `acknowledged` flag on Document model + acknowledge API routes (3 SP)
-- D2-T2 — MLID-2083 — Investigate entry points + emit `documentAdded` events (5 SP)
+### D2: Document Notification Wiring (8 SP)
+- D2-T1 — MLID-2082 — Notification API routes (list, mark read via `markUserNotificationAsRead`) (3 SP)
+- D2-T2 — MLID-2083 — Investigate entry points + create notifications + emit SignalR events (5 SP)
 
 ### D3: Notification UI (13 SP)
 - D3-T1 — MLID-2084 — Order Tracker: badges + "Action Required" filter (5 SP)
@@ -391,7 +612,7 @@ D0 (Azure SignalR Infrastructure — Anatoliy)
 
 - **Jira**: [MLID-2011](https://localinfusion.atlassian.net/browse/MLID-2011)
 - **Total Story Points**: 30
-- **Epic Branch**: `epic/MLID-2011-document-notifications`
+- **Epic Branch**: `epic/MLID-2011-order-document-notifications`
 - **Deliverables**: 4 (D0–D3)
 - **Total Tasks**: 8
 
@@ -408,19 +629,34 @@ D0 (Azure SignalR Infrastructure — Anatoliy)
 
 ---
 
+## Resolved Questions
+
+- **SignalR integration model** — Per-user JWT tokens via negotiate endpoint. Each browser calls `POST /api/signalr/negotiate` to get connection info. Hub name: `li-hub`. Connection string in Key Vault (`signalr-primary-connection-string`).
+- **Notification data model** — PE built two Mongoose models (PR #1049): `Notification` (shared, one doc per event) + `NotificationRead` (per-user read receipts for `user`-type notifications). Two types: `task` (actionable, any team member can acknowledge, inline global read via `isRead`/`readBy`/`readAt`) and `user` (informational, per-user independent read state via `notificationreads` collection). Targeting via `targetUserId` / `targetLocationId` / `targetRole` with OR logic. Entity linking is polymorphic with open-ended `entityType` strings (`order`, `document`, `patient`, `appointment`, `clinical-review`, etc.).
+- **Notification service** — Full CRUD service built by PE (PR #1049, 37 tests after review fixes): `createNotification()` (with target validation), `getNotificationsForUser()` (paginated, default limit 50, excludes expired), `getUnreadCountForUser()` (`$facet` aggregation, excludes expired), `getCountForEntity()` (with optional `unreadOnly`, excludes expired), `markTaskAsRead()` (type-guarded — only updates `task`-type, returns `null` for `user`-type), `markUserNotificationAsRead()` (idempotent, ignores duplicate key), `bulkMarkUserNotificationsAsRead()` (`insertMany({ ordered: false })`, handles `MongoBulkWriteError`), `isReadByUser()`.
+- **Notification type for document events** — ~~`task` type~~ **Updated 2026-04-07: `user` type.** Only the user assigned to the order can view and acknowledge documents. Notification targets `targetUserId` (order's assigned user). Read tracking via `NotificationRead` collection using `markUserNotificationAsRead()` and `bulkMarkUserNotificationsAsRead()`.
+- **Recipient targeting for document notifications** — ~~`targetLocationId` (all users at the clinic location)~~ **Updated 2026-04-07: `targetUserId`** (the order's assigned user). Single user sees and acknowledges.
+- **SignalR client context** — PE built `SignalRProvider` + `useSignalR()` hook with auto-reconnect (`[0, 2000, 5000, 10000, 30000]` delays).
+- **Notification retention** — PE added `expiresAt` field with sparse index (intentionally NOT a TTL index — no auto-deletion). Notifications with `expiresAt` in the past are excluded from queries via `buildUserTargetFilter()` but remain in the collection. Notifications with `expiresAt: null` (the default) live forever.
+- **Offline/reconnect** — `@microsoft/signalr` SDK has `withAutomaticReconnect()`. On reconnect, client re-fetches data from existing REST APIs. No gap detection needed — MongoDB is the source of truth.
+- **Existing Socket.IO** — Coexists. No migration in this epic. Call-status events stay on Socket.IO.
+- **Azure SignalR infrastructure** — Owned by Anatoliy (D0). Free tier for dev, Standard for staging/prod.
+
 ## Open Questions
 
 1. **Existing document upload paths** — Need to catalog all entry points where documents get attached to orders (webhooks, manual upload, fax integration, e-order). Investigation task D2-T2.
 2. **Order History tab** — Does it already exist? What's the current audit trail mechanism? Need to investigate.
-3. **Key Vault secret name** — Anatoliy to confirm naming convention for the SignalR connection string secret.
+3. ~~**`task` vs `user` type for document events**~~ — **Resolved (updated 2026-04-07):** `user` type. Only the user assigned to the order can view and acknowledge documents. Per-user read tracking via `NotificationRead` collection.
+4. ~~**`acknowledged` flag on documents**~~ — **Resolved:** Not needed. Badge counts are driven entirely from `Notification` + `NotificationRead` queries. No document model changes required.
+5. ~~**Recipient targeting for document notifications**~~ — **Resolved (updated 2026-04-07):** `targetUserId` (the order's assigned user).
+6. **Server-side broadcast** — PE built negotiate + token generation but not the broadcast function. Need to build `broadcastToRoom()` or `sendToAll()` to push events to connected clients.
+7. **SignalR env vars need to be set up in staging/prod infra** — As of D1-T1, three SignalR constants in `apps/web/services/signalr/index.ts` now read from env vars with fallback defaults:
+   - `SIGNALR_HUB_NAME` (default: `li-hub`)
+   - `SIGNALR_TOKEN_EXPIRY` (default: `1h`)
+   - `SIGNALR_REST_API_VERSION` (default: `2022-06-01`)
 
-## Resolved Questions
+   **Local dev is set up** — all three are defined in `apps/web/.env.local`.
 
-- **SignalR integration model** — The webapp is the SignalR client, not individual users. Connection string in Key Vault. Server broadcasts to rooms (topic channels). No per-user auth, no negotiate endpoint.
-- **Rooms as topic channels** — Rooms categorize broadcasts by feature area (like logging). `orders` for this epic. Future: `intakes`, `locations`, etc. Clients join the room relevant to their current view.
-- **Notification persistence** — No. Notifications are transient SignalR broadcasts (fire and forget). Source of truth is the existing MongoDB collections.
-- **Acknowledgement model** — Global per-document, not per-user. `acknowledged` boolean flag on the `documents` collection. When anyone clicks "Mark as Read", the document is marked as read for everyone. All other connected clients see the change via SignalR broadcast.
-- **No new collections** — No `notifications` collection. The `documents` collection drives UI state. SignalR just pushes transient alerts.
-- **Offline/reconnect** — `@microsoft/signalr` SDK has `withAutomaticReconnect()`. On reconnect, client re-fetches data from existing REST APIs. No gap detection needed — MongoDB is the source of truth.
-- **Existing Socket.IO** — Coexists. No migration in this epic. Call-status events stay on Socket.IO.
-- **Azure SignalR infrastructure** — Owned by Anatoliy (D0). Free tier for dev, Standard for staging/prod.
+   **Infra-side gap (action needed)** — I don't know how Anatoliy pushes env vars into our Azure infra (container env, Key Vault references, terraform variables, App Service config, etc.). Need guidance from him on how to add these three env vars to **staging** and **prod** environments so they're available when the app runs in the cloud. Fallback defaults in code mean nothing breaks if he doesn't add them — but ideally they should be explicit per environment so per-env overrides are possible.
+
+   **Action:** Ask Anatoliy how env vars are wired up in staging/prod and coordinate adding the three `SIGNALR_*` vars. Not blocking any current work — fallback defaults are correct for now.
