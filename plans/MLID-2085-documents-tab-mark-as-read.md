@@ -8,7 +8,7 @@
 - **Story Points**: 5
 - **Branch**: `feature/MLID-2085-documents-tab-mark-as-read`
 - **Base Branch**: `epic/MLID-2011-order-document-notifications`
-- **Status**: To Do
+- **Status**: Done — merged to epic 2026-04-20 (commit `a5c26763`). Manual QA verified by Alejandro; SignalR real-time event verification deferred to end-of-epic E2E pass.
 
 ---
 

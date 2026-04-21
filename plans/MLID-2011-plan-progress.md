@@ -603,10 +603,10 @@ Build the document notification experience: trigger SignalR events on document c
 | Task ID | Summary                                                                        | SP  | Status | Branch | Merged to Epic | Notes                                                                                                                                                                                                                               |
 | ------- | ------------------------------------------------------------------------------ | :-: | :----: | ------ | :------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | D3-T1   | Order Tracker: notification badge on Order ID + "Action Required" quick filter |  5  |  Done  | `feature/MLID-2084-order-tracker-badges` |      Yes       | [MLID-2084](https://localinfusion.atlassian.net/browse/MLID-2084) — Badge visibility globalized per 2026-04-14 decision. Manual QA verified on 05HP with seeded test data. `NewOrders.tsx` component test blocked by pre-existing BSON ESM issue in `__mocks__/bson.js` (not from this ticket) — backend files at 100% coverage. |
-| D3-T2   | Documents Tab: unread badge, "New" tags, "Mark as Read" (single + bulk)        |  5  | To Do  | -      |       -        | [MLID-2085](https://localinfusion.atlassian.net/browse/MLID-2085)                                                                                                                                                                   |
-| D3-T3   | Order History: document audit trail entries with source differentiation        |  3  | To Do  | -      |       -        | [MLID-2086](https://localinfusion.atlassian.net/browse/MLID-2086) — **Needs refinement:** clarify how notifications surface in order history (query notifications by entity? separate audit log entry? existing history mechanism?) |
+| D3-T2   | Documents Tab: unread badge, "New" tags, "Mark as Read" (single + bulk)        |  5  |  Done  | `feature/MLID-2085-documents-tab-mark-as-read` |      Yes       | [MLID-2085](https://localinfusion.atlassian.net/browse/MLID-2085) — Manual QA verified by Alejandro 2026-04-20. SignalR real-time event verification deferred to end-of-epic E2E pass. Merged to epic via `a5c26763`. |
+| D3-T3   | Order History: document audit trail entries with source differentiation        |  3  |  Done  | `feature/MLID-2086-order-history-document-audit` |      Yes       | [MLID-2086](https://localinfusion.atlassian.net/browse/MLID-2086) — Implemented 2026-04-20/21. `renderedChange` hook on `AuditFieldConfig` pre-computes display text server-side. `recordDocumentAddedToOrders()` service writes one audit entry per linked order. Wired at upload (`split-pdf/route.ts`) and e-order/fax (`weinfuseUploader.ts` with `intake.source === 'spruce'` detection). Manual QA verified on order 05Gy with seeded audit data. Merged to epic via `b6e64638`. |
 
-**D3 PR to develop:** Not yet — D3-T1 merged to epic 2026-04-15 (commit `20ca9ec4`); waiting on D3-T2 and D3-T3 before shipping the combined D2+D3 PR.
+**D3 PR to develop:** All three D3 tasks merged to epic — D3-T1 (`20ca9ec4`), D3-T2 (`a5c26763`), D3-T3 (`b6e64638`). Ready to ship combined D2+D3 PR to develop.
 
 ---
 
@@ -693,10 +693,209 @@ D0 (Azure SignalR Infrastructure — Anatoliy)
 - **Existing Socket.IO** — Coexists. No migration in this epic. Call-status events stay on Socket.IO.
 - **Azure SignalR infrastructure** — Owned by Anatoliy (D0). Free tier for dev, Standard for staging/prod.
 
+## D3-T3 Refinement (added 2026-04-20)
+
+### Corrected understanding
+
+**This task is NOT about surfacing notifications in Order History. It's about writing an entry to the existing `auditLogs` collection every time a document is added to an order, so the existing Order History tab displays it.**
+
+The previous plan conflated notifications with history. They're independent: notifications (already built in D2) drive the real-time badges/chips; audit logs (D3-T3) drive the permanent history tab entries.
+
+### Existing infrastructure (confirmed via codebase investigation)
+
+**Collection:** `auditLogs` — accessed via `COLLECTION.AuditLogs`.
+
+**Service layer:** `apps/web/services/mongodb/auditLog.ts`
+- `writeAuditLog({ entityType, entityId, action, actorId, changes, source })` — inserts a row. Fire-and-forget; swallows and logs errors.
+- `getAuditLog(params)` — paginated read with `$lookup` against `users` for actor name.
+- `getAuditLogFilterOptions(entityType, entityId)` — distinct fields/categories/actors for the filter UI.
+
+**Schema** (`apps/web/types/auditLog.ts`):
+```typescript
+{
+  entityType: 'order',            // currently hardcoded — no change needed
+  entityId: string,               // order _id
+  action: 'create' | 'update' | 'delete',
+  actorId: string,                // userId, or '' for system (renders as "System")
+  changes?: [{ field, from, to }],
+  source: 'user' | 'system' | 'webhook' | 'job',
+  timestamp: Date
+}
+```
+
+**Field→label/category config:** `apps/web/services/mongodb/auditLog.config.ts` — `ORDER_FIELD_CONFIG` map. Unknown fields fall through `humanizeFieldName` + category "Other".
+
+**Renderer:** `AuditLogTable.tsx` → `flattenEntries`:
+- `action: 'create'` → single row "Order Created", no change text
+- `action: 'update'` with `changes[]` → one row per change, formatted as `Original value: X\nNew value: Y`
+
+**Order History tab:** Already exists at `apps/web/app/orders-tracker/[category]/[orderId]/order-history/` with page, hooks, filters, and table. **No UI work needed** — the row will render automatically once the audit entries are written.
+
+### Document → order linkage (already built in D2-T2)
+
+`apps/web/services/notifications/documentNotification.ts` — `notifyDocumentCreated()` already performs the full document → patient → active `neworders` lookup:
+
+1. Looks up patient by `patientId` → reads `we_infuse_id_IV`.
+2. Finds all active `neworders` where `patient.we_infuse_id_IV` matches and `deleted !== true`.
+3. Iterates each order; per order, creates notification + broadcasts SignalR event.
+
+**This is the right place to piggyback the audit log write** — same loop, same per-order scope, same entry points. One audit log row per active order per document.
+
+### Fitting document additions into the existing `auditLogs` schema
+
+The `auditLogs` schema is entity-agnostic (`entityType` is a discriminator — designed for `'order'` today, more entities later) and `changes[].from` / `changes[].to` are typed `unknown` — they already accept scalar references to other collections (`assignedTo: '<userId>'`, `provider: '<providerNpi>'`) as well as primitive values (`dueDate`, `notes`). Adding a document to an order is just another relation change, following the same pattern, with no schema extensions required.
+
+**Data shape stored in the collection** — `changes[0]`:
+
+```typescript
+{
+  field: 'documents',       // name of the relation on the order
+  from: null,               // document did not exist before this event
+  to: {                     // snapshot of what was added — preserved forever
+    _id: '<documentId>',    // document id (always string for consistency)
+    category: 'Lab Results',// human-readable document category
+    source: 'fax',          // 'fax' | 'e-order' | 'upload'
+  },
+}
+```
+
+Why this fits cleanly:
+
+- **No new fields on `AuditLogChange`.** `to: unknown` already accepts object values.
+- **No overloading of the entry-level `source` enum.** Document origin lives on the `to` snapshot as a property; the entry-level `source` still means "who wrote the audit row" (`user` / `system` / `webhook` / `job`).
+- **`from: null, to: <object>` = "added" semantic**, mirroring the way other relation fields (`assignedTo`, `provider`) read before/after. A future `documentRemoved` event would use the same field with `from: <snapshot>, to: null`.
+- **No new action type.** Stays `action: 'update'` — consistent with the "something about this order changed" meaning of an update action. Other options rejected:
+  - `action: 'create'` — already means "order was created" in the renderer (`AuditLogTable.tsx:31-40`).
+  - A new `action: 'relation-added'` — ripples through types, API filters, the filter UI, and the `AuditAction` union. Not worth it for a visual-only concern.
+
+### Designer reference (Screenshot 2026-04-20 100214.png)
+
+Row layout matches the existing table:
+
+| Date & Time | Field            | Category      | Change                                                    | User   |
+| ----------- | ---------------- | ------------- | --------------------------------------------------------- | ------ |
+| 10/8/2025   | **New Document** | **Documents** | **New Document received (Document type = Lab Results)**   | System |
+
+**The "Change" cell text is built in the renderer, not read from the collection.** The existing `AuditLogTable.flattenEntries` at `AuditLogTable.tsx:48` constructs the two-line `Original value: ${change.from}\nNew value: ${change.to}` string from raw `from`/`to` values. We follow the same pattern — the renderer reads the structured `to` object and formats it.
+
+**Text format (literal):**
+```
+New Document received (Document type = <to.category>)
+```
+
+Source (`to.source`) is stored but not displayed in this iteration — the designer reference shows no source in the Change text. Source stays on the snapshot so a future UI change (e.g., a source column or suffix) can surface it without a data migration.
+
+### Gap Resolutions — D3-T3
+
+#### Gap 1 — Renderer has no single-description cell format
+
+**Decision:** Extend `AuditFieldConfig` with an optional `renderChange?: (change: AuditLogChange) => string` hook. When set, `flattenEntries` delegates to the hook instead of the default `Original value: X\nNew value: Y` formatter. This keeps the renderer generic (no hardcoded field checks) and makes the mapping discoverable via the config.
+
+For the `documents` field, the hook reads the structured `to` snapshot:
+
+```typescript
+documents: {
+  label: 'New Document',
+  category: 'Documents',
+  renderChange: (change) => {
+    const to = change.to as { category?: string } | null;
+    return `New Document received (Document type = ${to?.category ?? 'Unknown'})`;
+  },
+}
+```
+
+The hook is free to read any field on the snapshot object — keeps display decisions out of the data layer and co-located with the field config.
+
+#### Gap 2 — Storing "source" (Fax / E-Order / Upload) without new schema fields
+
+**Decision:** Put `source` on the `to` snapshot object, not on a new top-level field. The `AuditLogChange` schema already allows `to: unknown`, so a nested `source` property is free — it's just a property on the snapshot.
+
+```typescript
+to: { _id, category, source }   // source lives here
+```
+
+Rejected alternatives:
+
+- **New `meta?: Record<string, unknown>` field on `AuditLogChange`** — unnecessary given `to` already accepts objects. Adding a field would be an outward schema change for a concern that's already expressible.
+- **Overload the entry-level `source` enum** — that field currently means "who wrote the audit row" (user vs webhook vs job). Overloading it with document origin would break the meaning for every consumer.
+- **A second change entry `{ field: 'documentSource', to: 'Fax' }`** — would render as a second row in the history table with no designer guidance on how it should look.
+
+**Display status:** not rendered in this iteration (per the designer reference text). Stored so a future UI change can surface it without a data migration.
+
+**Source → label mapping** (mirrors `documentNotification.ts` `SOURCE_LABELS`):
+- `upload` → `Upload`
+- `e-order` → `E-Order`
+- (future) `fax` → `Fax`
+
+#### Gap 3 — `actorId` and audit-log `source` for document events
+
+**Decision:**
+- **E-Order / webhook ingestion:** `actorId: ''` (renders as "System"), audit-log `source: 'webhook'`.
+- **Manual upload (logged-in user):** `actorId: session.user.id`, audit-log `source: 'user'`.
+- **System-generated (jobs, migrations):** `actorId: ''`, `source: 'system'`.
+
+The entry point decides; `notifyDocumentCreated`'s caller passes `actorId` and `source` forward to the audit write.
+
+#### Gap 4 — Order History tab shown above the Documents tab — consistency
+
+**Decision:** No changes to the Order History tab UI. Entries appear automatically via the existing page pipeline because `entityType: 'order'` + `entityId: orderId` already scope the query. The new field "New Document" will appear in the filter dropdowns automatically via `getAuditLogFilterOptions` (distinct field values).
+
+### Implementation sketch (for the plan-task phase)
+
+1. Extend `AuditFieldConfig` type with an optional `renderChange?: (change: AuditLogChange) => string` hook.
+2. Add `documents` to `ORDER_FIELD_CONFIG`:
+   ```typescript
+   documents: {
+     label: 'New Document',
+     category: 'Documents',
+     renderChange: (change) => {
+       const to = change.to as { category?: string } | null;
+       return `New Document received (Document type = ${to?.category ?? 'Unknown'})`;
+     },
+   }
+   ```
+3. Update `AuditLogTable.flattenEntries` to check `getFieldConfig(change.field).renderChange` — if defined, use it; otherwise keep the existing two-line format. Serialization note: existing rendering calls `displayValue(change.from)` / `displayValue(change.to)` which coerces objects via `String()` — that produces `[object Object]`. The `renderChange` branch runs before `displayValue`, so object-valued changes only need to reach the default path for fields that don't define a hook (and today, no existing field stores an object — so there's no regression risk).
+4. Create `services/audit/documentAudit.ts` with `recordDocumentAddedToOrders({ documentId, patientId, category, source, actorId })`. Mirrors `notifyDocumentCreated`'s patient → `neworders` lookup (same `we_infuse_id_IV` → `patient.we_infuse_id_IV` + `deleted !== true` filter) and writes one `writeAuditLog` row per order:
+   ```typescript
+   writeAuditLog({
+     entityType: 'order',
+     entityId: orderId,
+     action: 'update',
+     actorId,                // userId for uploads, '' for webhook/system
+     source: actorId ? 'user' : 'webhook',
+     changes: [{
+       field: 'documents',
+       from: null,
+       to: { _id: documentId, category, source },
+     }],
+   })
+   ```
+5. Wire it at the same entry points that call `notifyDocumentCreated` (both calls sit next to each other — same data needed, same fire-and-forget semantics). Confirm the call signature exposes `actorId` at each entry point.
+6. Unit tests for:
+   - The renderer: hook resolution precedence (hook wins over default format); default format preserved for fields without a hook.
+   - `getFieldConfig('documents')` returns the config with the hook; unknown fields still fall through to `humanizeFieldName`.
+   - `recordDocumentAddedToOrders`: patient-not-found / no-we-infuse-id / no-orders / assigned-and-unassigned orders / partial failure (one of N orders throws — the others still get a row); feature-flag gating.
+   - Integration: at each document entry point, audit write fires with the correct payload.
+
+### Alternative considered (rejected)
+
+**Bundle the audit write inside `notifyDocumentCreated`.** Rejected — mixes two concerns (transient push + permanent history) into one function. They share lookup logic but have independent failure modes, feature-flag gating semantics, and testing surfaces. Better to keep them parallel and call both from the same entry points.
+
+### Feature-flag gating
+
+**Decision:** **Gated behind `ORDER_DOCUMENT_NOTIFICATIONS`** alongside notifications. If the epic is toggled off, no audit entries are written either — consistent with the existing flag's "this epic is live" semantics. Revisit if the flag survives post-epic (it probably should not).
+
+### Remaining open questions
+
+1. **Document categories used for the "Document type" text** — confirm the category string we receive from each entry point is the human-readable label (e.g., "Lab Results") or an enum key we need to format. `documentNotification.ts` passes `category` through raw — need to verify against actual document schema.
+2. **Fax ingestion entry point** — D2-T2 enumerated only `upload` and `e-order`. The epic mentions "Fax" explicitly. Does fax go through a separate entry point, or is it folded into `upload` via the fax → upload gateway? This affects whether we need a third `source` value.
+
+---
+
 ## Open Questions
 
 1. **Existing document upload paths** — Need to catalog all entry points where documents get attached to orders (webhooks, manual upload, fax integration, e-order). Investigation task D2-T2.
-2. **Order History tab** — Does it already exist? What's the current audit trail mechanism? Need to investigate.
+2. ~~**Order History tab**~~ — **Resolved 2026-04-20:** tab already exists at `/orders-tracker/[category]/[orderId]/order-history`, backed by the existing `auditLogs` collection. D3-T3 writes to this collection — no UI work on the tab itself.
 3. ~~**`task` vs `user` type for document events**~~ — **Resolved (updated 2026-04-07):** `user` type. Only the user assigned to the order can view and acknowledge documents. Per-user read tracking via `NotificationRead` collection.
 4. ~~**`acknowledged` flag on documents**~~ — **Resolved:** Not needed. Badge counts are driven entirely from `Notification` + `NotificationRead` queries. No document model changes required.
 5. ~~**Recipient targeting for document notifications**~~ — **Resolved (updated 2026-04-07, amended 2026-04-14):** `targetUserId` still set to the order's assigned user for Mark-as-Read ownership, but entity-scoped badge counts are now **globally visible** to all authenticated users (see "Update 2026-04-14 — Decouple Badge Visibility from Notification Ownership" section).

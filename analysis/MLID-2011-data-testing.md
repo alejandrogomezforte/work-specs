@@ -254,10 +254,20 @@ db.notificationreads.deleteMany({
 
 ### Notifications Inserted
 
-| # | notification _id           | targetUserId             | order _id (displayId)         | document _id (category)                  |
-|---|----------------------------|--------------------------|-------------------------------|------------------------------------------|
-| 1 | 69dfd3ecadc73ef87c73c047   | 67fe5a27c4d62cde04add191 | 69de2b8a0971dd1aa4b82441 (05HP) | 69de22d0db1282f388db61d0 (Prior Authorization) |
-| 2 |                            |                          |                               |                                          |
-| 3 |                            |                          |                               |                                          |
-| 4 |                            |                          |                               |                                          |
-| 5 |                            |                          |                               |                                          |
+| # | notification _id           | targetUserId             | order _id (displayId)            | document _id (category)                            |
+|---|----------------------------|--------------------------|----------------------------------|----------------------------------------------------|
+| 1 | 69dfd3ecadc73ef87c73c047   | 67fe5a27c4d62cde04add191 | 69de2b8a0971dd1aa4b82441 (05HP)  | 69de22d0db1282f388db61d0 (Prior Authorization)     |
+| 2 | 69dfe246adc73ef87c73c048   | 67fe5a27c4d62cde04add191 | 69de2b6b0971dd1aa4b8243f (05HO)  | 69d3a9fb082b98de0f34bacc (Lab Results)              |
+| 3 | 69dfe246adc73ef87c73c049   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8e9a73f54d46ff950cf2 (Insurance Card)           |
+| 4 | 69dfe246adc73ef87c73c04a   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8c7573f54d46ff950c5e (Order)                    |
+| 5 | 69dfe246adc73ef87c73c04b   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8aee73f54d46ff9507bb (Order)                    |
+| 6 | 69dfe246adc73ef87c73c04c   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8aec73f54d46ff9507b4 (Lab Results)              |
+| 7 | 69dfe246adc73ef87c73c04d   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8aeb73f54d46ff9507af (Supporting Medical Doc)   |
+| 8 | 69dfe246adc73ef87c73c04e   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8aeb73f54d46ff9507aa (Insurance Card)           |
+| 9 | 69dfe246adc73ef87c73c04f   | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf8aea73f54d46ff9507a4 (Referral Copy)            |
+| 10 | 69dfe246adc73ef87c73c050  | 695c25a530f7a75a8b1ed8c8 | 69cf9aee03a194bd1a65a199 (05Gy)  | 69cf89d373f54d46ff950572 (Supporting Medical Doc)   |
+| 11 | 69dfe246adc73ef87c73c051  | 67fe9b98a5133e710d95527e | 69a55c9cd67d0c3ea0432544 (05Dy)  | 69cbc7edc62d1cbfc4f198a6 (Order)                    |
+| 12 | 69dfe246adc73ef87c73c052  | 682625f5f91fa5e600a51f0a | 69cc126a86c104551909ddd5 (05Gi)  | 69cbb855c62d1cbfc4f17af0 (Order)                    |
+| 13 | 69dfe246adc73ef87c73c053  | 682625f5f91fa5e600a51f0a | 69cc11ce86c104551909ddd3 (05Gh)  | 69cbb854c62d1cbfc4f17ae0 (Demographics)             |
+| 14 | 69dfe246adc73ef87c73c054  | 696020a37fd0f57284c5b121 | 69cc116986c104551909ddd0 (05Gg)  | 69cbb853c62d1cbfc4f17adb (Lab Results)              |
+| 15 | 69dfe246adc73ef87c73c055  | 682625f5f91fa5e600a51f0a | 69cc126a86c104551909ddd5 (05Gi)  | 69cbb852c62d1cbfc4f17ad5 (Supporting Medical Doc)   |
