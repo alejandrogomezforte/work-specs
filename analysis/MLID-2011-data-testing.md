@@ -271,3 +271,173 @@ db.notificationreads.deleteMany({
 | 13 | 69dfe246adc73ef87c73c053  | 682625f5f91fa5e600a51f0a | 69cc11ce86c104551909ddd3 (05Gh)  | 69cbb854c62d1cbfc4f17ae0 (Demographics)             |
 | 14 | 69dfe246adc73ef87c73c054  | 696020a37fd0f57284c5b121 | 69cc116986c104551909ddd0 (05Gg)  | 69cbb853c62d1cbfc4f17adb (Lab Results)              |
 | 15 | 69dfe246adc73ef87c73c055  | 682625f5f91fa5e600a51f0a | 69cc126a86c104551909ddd5 (05Gi)  | 69cbb852c62d1cbfc4f17ad5 (Supporting Medical Doc)   |
+
+### Audit Logs Inserted (MLID-2086 — Order History document rows)
+
+Seeded `auditLogs` entries for order `69cf9aee03a194bd1a65a199` (`05Gy`, Justin Tracey QA) so the Order History tab renders document-add rows via the `documents` field's `renderChange` hook. The 8 document IDs below match the patient's documents in the earlier table, so the same order is covered by both notifications (badges) and audit logs (history).
+
+**Mongo Compass filter for this order's full audit log (11 rows — create + 2 assignedTo updates + 8 document adds):**
+
+```json
+{ "entityType": "order", "entityId": "69cf9aee03a194bd1a65a199" }
+```
+
+**Mongo Compass filter for only the seeded document-add rows (8 rows):**
+
+```json
+{ "entityType": "order", "entityId": "69cf9aee03a194bd1a65a199", "changes.field": "documents" }
+```
+
+Suggested sort: `{ "timestamp": -1 }`.
+
+| # | auditLog _id               | action  | source  | timestamp (UTC)              | document _id (category, source)                                       |
+|---|----------------------------|---------|---------|------------------------------|-----------------------------------------------------------------------|
+|  1 | 69e7ac9e49f15a2c641c087f  | update  | user    | 2026-04-03 09:55:38.439      | 69cf8e9a73f54d46ff950cf2 (Insurance Card, upload)                     |
+|  2 | 69e7ad1549f15a2c641c0880  | update  | webhook | 2026-04-03 09:46:29.185      | 69cf8c7573f54d46ff950c5e (Order, e-order)                             |
+|  3 | 69e7ad1549f15a2c641c0881  | update  | webhook | 2026-04-03 09:39:58.115      | 69cf8aee73f54d46ff9507bb (Order, fax)                                 |
+|  4 | 69e7ad1549f15a2c641c0882  | update  | user    | 2026-04-03 09:39:56.266      | 69cf8aec73f54d46ff9507b4 (Lab Results, upload)                        |
+|  5 | 69e7ad1549f15a2c641c0883  | update  | webhook | 2026-04-03 09:39:55.745      | 69cf8aeb73f54d46ff9507af (Supporting Medical Document, e-order)       |
+|  6 | 69e7ad1549f15a2c641c0884  | update  | webhook | 2026-04-03 09:39:55.063      | 69cf8aeb73f54d46ff9507aa (Insurance Card, fax)                        |
+|  7 | 69e7ad1549f15a2c641c0885  | update  | user    | 2026-04-03 09:39:54.076      | 69cf8aea73f54d46ff9507a4 (Referral Copy, upload)                      |
+|  8 | 69e7ad1549f15a2c641c0886  | update  | webhook | 2026-04-03 09:35:15.345      | 69cf89d373f54d46ff950572 (Supporting Medical Document, e-order)       |
+
+**Shape of each seeded entry** (for reference when adding more):
+
+```js
+{
+  entityType: 'order',
+  entityId:   '<order _id string>',
+  action:     'update',
+  actorId:    '<user _id>' | '',     // empty string when source is 'webhook'
+  source:     'user' | 'webhook',
+  timestamp:  ISODate(...),
+  changes: [
+    {
+      field: 'documents',
+      from:  null,
+      to: {
+        _id:      '<document _id string>',
+        category: '<document category>',
+        source:   'upload' | 'e-order' | 'fax' | ...,
+      },
+    },
+  ],
+}
+```
+
+---
+
+## Quick Reference — Alejandro's Test Order (`05Gy`)
+
+All seeded entities tied to the order used for two-tab Mark-as-Read SignalR validation. Login as user `695c25a530f7a75a8b1ed8c8` (Alejandro).
+
+**Caveat on `assignedTo`:** In `neworders` this order's `assignedTo` is Olga Turovych (`686eb246db18cb88c3956078`), not Alejandro. The 8 seeded notifications below explicitly set `targetUserId: '695c25a530f7a75a8b1ed8c8'`, so Alejandro is the read-receipt owner for test purposes. The Mark-as-Read button renders for whoever the notification targets, regardless of who the order is assigned to.
+
+**Test URLs:**
+
+- Tab A (order layout — Documents tab strip badge): `http://localhost:8080/orders-tracker/new/69cf9aee03a194bd1a65a199`
+- Tab B (Documents tab — row chips + Mark as Read button): `http://localhost:8080/orders-tracker/new/69cf9aee03a194bd1a65a199/documents`
+
+### Top-level IDs
+
+| Entity                      | ID                                                  | Notes                            |
+|-----------------------------|-----------------------------------------------------|----------------------------------|
+| Test user (Alejandro)       | `695c25a530f7a75a8b1ed8c8`                          | `targetUserId` on all 8 notifs   |
+| Order                       | `69cf9aee03a194bd1a65a199`                          | displayId `05Gy`                 |
+| Patient                     | `69cf89d202323d384fe6dc8e`                          | Justin Tracey QA, `we_infuse_id_IV: 8905` |
+| Order's `assignedTo` in DB  | `686eb246db18cb88c3956078`                          | Olga Turovych (not Alejandro)    |
+
+### Documents (8) — under patient `69cf89d202323d384fe6dc8e`
+
+| # | document `_id`              | category                      |
+|---|-----------------------------|-------------------------------|
+| 1 | `69cf8e9a73f54d46ff950cf2`  | Insurance Card                |
+| 2 | `69cf8c7573f54d46ff950c5e`  | Order                         |
+| 3 | `69cf8aee73f54d46ff9507bb`  | Order                         |
+| 4 | `69cf8aec73f54d46ff9507b4`  | Lab Results                   |
+| 5 | `69cf8aeb73f54d46ff9507af`  | Supporting Medical Document   |
+| 6 | `69cf8aeb73f54d46ff9507aa`  | Insurance Card                |
+| 7 | `69cf8aea73f54d46ff9507a4`  | Referral Copy                 |
+| 8 | `69cf89d373f54d46ff950572`  | Supporting Medical Document   |
+
+### Notifications (8) — `targetUserId: 695c25a530f7a75a8b1ed8c8`, order `69cf9aee03a194bd1a65a199`
+
+| # | notification `_id`          | document `_id`              | category                      |
+|---|-----------------------------|-----------------------------|-------------------------------|
+| 1 | `69dfe246adc73ef87c73c049`  | `69cf8e9a73f54d46ff950cf2`  | Insurance Card                |
+| 2 | `69dfe246adc73ef87c73c04a`  | `69cf8c7573f54d46ff950c5e`  | Order                         |
+| 3 | `69dfe246adc73ef87c73c04b`  | `69cf8aee73f54d46ff9507bb`  | Order                         |
+| 4 | `69dfe246adc73ef87c73c04c`  | `69cf8aec73f54d46ff9507b4`  | Lab Results                   |
+| 5 | `69dfe246adc73ef87c73c04d`  | `69cf8aeb73f54d46ff9507af`  | Supporting Medical Document   |
+| 6 | `69dfe246adc73ef87c73c04e`  | `69cf8aeb73f54d46ff9507aa`  | Insurance Card                |
+| 7 | `69dfe246adc73ef87c73c04f`  | `69cf8aea73f54d46ff9507a4`  | Referral Copy                 |
+| 8 | `69dfe246adc73ef87c73c050`  | `69cf89d373f54d46ff950572`  | Supporting Medical Document   |
+
+### Audit logs (8) — `entityId: 69cf9aee03a194bd1a65a199`, `changes.field: 'documents'`
+
+| # | auditLog `_id`              | source   | document `_id`              | category (source label)                         |
+|---|-----------------------------|----------|-----------------------------|-------------------------------------------------|
+| 1 | `69e7ac9e49f15a2c641c087f`  | user     | `69cf8e9a73f54d46ff950cf2`  | Insurance Card (upload)                         |
+| 2 | `69e7ad1549f15a2c641c0880`  | webhook  | `69cf8c7573f54d46ff950c5e`  | Order (e-order)                                 |
+| 3 | `69e7ad1549f15a2c641c0881`  | webhook  | `69cf8aee73f54d46ff9507bb`  | Order (fax)                                     |
+| 4 | `69e7ad1549f15a2c641c0882`  | user     | `69cf8aec73f54d46ff9507b4`  | Lab Results (upload)                            |
+| 5 | `69e7ad1549f15a2c641c0883`  | webhook  | `69cf8aeb73f54d46ff9507af`  | Supporting Medical Document (e-order)           |
+| 6 | `69e7ad1549f15a2c641c0884`  | webhook  | `69cf8aeb73f54d46ff9507aa`  | Insurance Card (fax)                            |
+| 7 | `69e7ad1549f15a2c641c0885`  | user     | `69cf8aea73f54d46ff9507a4`  | Referral Copy (upload)                          |
+| 8 | `69e7ad1549f15a2c641c0886`  | webhook  | `69cf89d373f54d46ff950572`  | Supporting Medical Document (e-order)           |
+
+### Mongo Compass quick filters (this order)
+
+```json
+{ "_id": ObjectId("69cf9aee03a194bd1a65a199") }
+```
+
+```json
+{ "entities.entityId": "69cf9aee03a194bd1a65a199", "targetUserId": "695c25a530f7a75a8b1ed8c8" }
+```
+
+```json
+{ "userId": "695c25a530f7a75a8b1ed8c8", "notificationId": { "$in": [
+  ObjectId("69dfe246adc73ef87c73c049"), ObjectId("69dfe246adc73ef87c73c04a"),
+  ObjectId("69dfe246adc73ef87c73c04b"), ObjectId("69dfe246adc73ef87c73c04c"),
+  ObjectId("69dfe246adc73ef87c73c04d"), ObjectId("69dfe246adc73ef87c73c04e"),
+  ObjectId("69dfe246adc73ef87c73c04f"), ObjectId("69dfe246adc73ef87c73c050")
+] } }
+```
+
+```json
+{ "entityType": "order", "entityId": "69cf9aee03a194bd1a65a199", "changes.field": "documents" }
+```
+
+(Run against `neworders`, `notifications`, `notificationreads`, and `auditLogs` respectively.)
+
+### Targeted resets — re-create unread state for re-testing
+
+**Undo a single Mark-as-Read:**
+
+```js
+db.notificationreads.deleteOne({
+  notificationId: ObjectId('<notification _id from the table above>'),
+  userId: '695c25a530f7a75a8b1ed8c8',
+});
+```
+
+**Undo all 8 (full reset to all-unread):**
+
+```js
+db.notificationreads.deleteMany({
+  userId: '695c25a530f7a75a8b1ed8c8',
+  notificationId: { $in: [
+    ObjectId('69dfe246adc73ef87c73c049'),
+    ObjectId('69dfe246adc73ef87c73c04a'),
+    ObjectId('69dfe246adc73ef87c73c04b'),
+    ObjectId('69dfe246adc73ef87c73c04c'),
+    ObjectId('69dfe246adc73ef87c73c04d'),
+    ObjectId('69dfe246adc73ef87c73c04e'),
+    ObjectId('69dfe246adc73ef87c73c04f'),
+    ObjectId('69dfe246adc73ef87c73c050'),
+  ] },
+});
+```
+
+Refresh both tabs after the delete — chips and Mark-as-Read buttons reappear, Tab A's tab-strip badge increments back to 8.

@@ -610,6 +610,87 @@ Build the document notification experience: trigger SignalR events on document c
 
 ---
 
+## Deliverable 4: Verification & SignalR Gap Closure (Post-D3)
+
+**Goal:** Close out everything surfaced after D3 merged — execute the manual verification plans we scoped, fill in the detailed backend-trigger strategy, and address the SignalR architectural gaps we identified while scoping the verification. This is forward-looking work; estimates are provisional and T3 is an umbrella that will likely split into sub-tasks once scoped.
+
+**Depends on:** D3 (all three UI tasks merged to epic).
+
+### Reading order (for recap after `/clear`)
+
+Read the docs in this order to rebuild context fast:
+
+1. `docs/agomez/analysis/how-signalR-implementation-works.md` — SignalR architecture, dispatchers, listeners, gaps. Start here.
+2. `docs/agomez/analysis/MLID-2011-testing-signalr-integration.md` — manual test scenarios for SignalR. Read next.
+3. `docs/agomez/analysis/MLID-2011-testing-backend-triggers.md` — scoping doc for the backend-trigger testing strategy (detailed plan still to be written).
+4. `docs/agomez/analysis/MLID-2011-data-testing.md` — seeded test data (notifications + audit logs) used by the two testing docs above.
+5. This plan (`docs/agomez/plans/MLID-2011-plan-progress.md`) — overall epic status.
+
+### Tasks
+
+| Task ID | Summary                                                                   |    SP    | Status | Branch | Merged to Epic | Notes                                                     |
+| ------- | ------------------------------------------------------------------------- | :------: | :----: | ------ | :------------: | --------------------------------------------------------- |
+| D4-T1   | Execute SignalR integration testing (6 manual scenarios + debugging pass) |    2     | To Do  | —      |       —        | Reference: `MLID-2011-testing-signalr-integration.md`     |
+| D4-T2   | Write + execute backend-trigger test strategy                             |    3     | To Do  | —      |       —        | Reference: `MLID-2011-testing-backend-triggers.md`        |
+| D4-T3   | Close SignalR architectural gaps (umbrella — to be broken down)           |   TBD    | To Do  | —      |       —        | Reference: gaps §3 of `how-signalR-implementation-works.md` |
+
+**D4 PR to develop:** Not applicable yet. T1/T2 produce test reports and (if needed) bugfix PRs. T3 will likely split into individual feature PRs once scoped.
+
+### D4-T1 — SignalR integration testing (execute)
+
+Run the 6 manual scenarios in `MLID-2011-testing-signalr-integration.md` against staging with the `ORDER_DOCUMENT_NOTIFICATIONS` flag ON and the seeded test order `05Gy` (`69cf9aee03a194bd1a65a199`):
+
+- Scenario A — Order list badge updates live (`useOrderNotificationCounts` + `documentAdded`).
+- Scenario B — Documents-tab badge updates live (`useDocumentsTabNotifications` + `documentAdded`).
+- Scenario C — `notification:read` propagation between tabs.
+- Scenario D — Reconnect catch-up (offline → online → state reconciles).
+- Scenario E — Feature flag OFF disables all real-time behavior cleanly.
+- Scenario F — Cross-tab noise boundary (broadcast-to-all + local filtering).
+
+**Definition of done:** each scenario passes the "Expected" checks in the doc, or a defect is filed. Open a bugfix branch for any fix found here.
+
+### D4-T2 — Backend-trigger testing strategy + execution
+
+Two sub-deliverables:
+
+1. **Write the detailed strategy.** `MLID-2011-testing-backend-triggers.md` is today a scoping doc. Turn it into an executable strategy covering the checklist already listed there (happy path, flag OFF, unassigned order, legacy email-shaped `assignedTo`, Jotform/WeinfuseUploader parity, idempotent reads, bulk partial lists, PHI masking, Mongoose-only confirmation).
+2. **Execute the strategy.** Exercise each entry point (`POST /api/documents/split-pdf`, JotForm job, `PATCH /api/notifications/[id]/read`, `PATCH /api/notifications/bulk-read`) and verify the database writes + broadcast side effects match expectations.
+
+**Definition of done:** updated doc + a test-run report (pass/fail per row of the checklist) + bugfix PRs for anything that fails.
+
+### D4-T3 — SignalR architectural gaps (umbrella)
+
+The gaps listed in §3 of `how-signalR-implementation-works.md`. Not all of these need to ship in this epic — we'll prioritize once we have the D4-T1/T2 test results:
+
+1. No per-user / per-location / per-group targeting — broadcast-to-all amplifies client work.
+2. No replay/catch-up on reconnect — events dropped during disconnects are lost (mitigated only by mount-time refetch).
+3. No SignalR event for notifications created outside `notifyDocumentCreated()` — other write paths are invisible to clients.
+4. Payloads are not consumed by listeners — they always refetch, which is N+1 on bursts.
+5. No UI indicator of SignalR connection health — badges silently stop updating when disconnected.
+6. Dispatch side not feature-flagged separately from write side — can't "write but don't broadcast" for staged rollouts.
+7. No automated end-to-end (Playwright) coverage of broadcast→UI.
+8. No dead-letter / observability on broadcast failures — errors are logged and swallowed.
+
+**Before starting:** break this task into per-gap sub-tasks in Jira, estimate them, and decide which are in-scope for this epic vs. which graduate to follow-on tickets. Gaps 5 (connection health UI) and 7 (Playwright) are the most likely epic-scope candidates; 1, 3, 6 are larger architectural changes and probably belong to a follow-on.
+
+### Retrospective notes (work already done)
+
+The following items also sit under D4 conceptually but are already complete and carry no further work — kept here so the history is traceable:
+
+- **Develop → epic merge.** Merge commit `66a9cb5d` on `epic/MLID-2011-order-document-notifications`, pushed. Three conflicts resolved:
+  - `apps/web/app/orders-tracker/[category]/[orderId]/layout.tsx` — took develop's refactored `<Tabs>` base, re-applied epic's `useDocumentsTabNotifications` hook + `TabItem.badge` wiring. Dropped the hand-styled badge JSX.
+  - `apps/web/app/orders-tracker/[category]/[orderId]/layout.test.tsx` — union of new tests, dropped obsolete `@/components/UI` `Tab` mock + unused `React` import, updated 3 badge tests to `getByTestId('badge-Documents')`.
+  - `apps/web/services/mongodb/__tests__/auditLog.test.ts` — pure union of 3 new `it()` blocks.
+  - **Build gotcha:** develop extracted `packages/intake-ocr/` as a new workspace package with `main: "./dist/index.js"`. `npm install` doesn't build it — had to run `npm run build` in `packages/intake-ocr/` before `types:check` and full test runs resolved.
+  - **Tests on resolved files:** 33/33 on `layout.test.tsx`, 26/26 on `auditLog.test.ts`. Pre-existing V8 crash on `apps/web/app/api/jobs/orders-tracker/export/route.test.ts` reproduces on plain develop — not merge-caused.
+- **SignalR architecture + testing docs split.** Produced:
+  - `docs/agomez/analysis/how-signalR-implementation-works.md` (architecture reference)
+  - `docs/agomez/analysis/MLID-2011-testing-signalr-integration.md` (manual test scenarios)
+  - `docs/agomez/analysis/MLID-2011-testing-backend-triggers.md` (scoping for D4-T2)
+  - Addendum to `docs/agomez/analysis/MLID-2011-data-testing.md` with the 8 seeded auditLog rows for order `05Gy` and Mongo Compass filters.
+
+---
+
 ## Task List
 
 ### D0: Azure SignalR Infrastructure (3 SP) — Anatoliy
@@ -632,6 +713,12 @@ Build the document notification experience: trigger SignalR events on document c
 - D3-T2 — MLID-2085 — Documents Tab: "New" tags + "Mark as Read" (single + bulk) (5 SP)
 - D3-T3 — MLID-2086 — Order History: audit trail entries (3 SP)
 
+### D4: Verification & SignalR Gap Closure (~5 SP + TBD) — no Jira sub-tasks yet
+
+- D4-T1 — Execute SignalR integration testing (6 manual scenarios) (2 SP)
+- D4-T2 — Write + execute backend-trigger test strategy (3 SP)
+- D4-T3 — Close SignalR architectural gaps (umbrella — TBD; split into Jira sub-tasks before estimating)
+
 ---
 
 ## Dependency Graph
@@ -641,6 +728,7 @@ D0 (Azure SignalR Infrastructure — Anatoliy)
  └── D1 (SignalR Integration) ── depends on D0
       └── D2 (Document Notifications + Acknowledgement) ── depends on D1
            └── D3 (Notification UI) ── depends on D2
+                └── D4 (Unexpected Fixes & Documentation) ── follows D3
 ```
 
 ---
@@ -662,10 +750,10 @@ D0 (Azure SignalR Infrastructure — Anatoliy)
 ## Epic Reference
 
 - **Jira**: [MLID-2011](https://localinfusion.atlassian.net/browse/MLID-2011)
-- **Total Story Points**: 30
+- **Total Story Points**: 30 planned + D4 (~5 SP known + TBD umbrella)
 - **Epic Branch**: `epic/MLID-2011-order-document-notifications`
-- **Deliverables**: 4 (D0–D3)
-- **Total Tasks**: 8
+- **Deliverables**: 5 (D0–D4)
+- **Total Tasks**: 11 (8 planned + 3 in D4, pending umbrella breakdown)
 
 ---
 
