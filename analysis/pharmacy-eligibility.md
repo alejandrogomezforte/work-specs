@@ -52,8 +52,8 @@ Six collections participate in the pharmacy eligibility calculation. Only fields
 |-------|------|---------|
 | `we_infuse_patient_id` | number | Matched from `patients.we_infuse_id_IV` |
 | `priority` | string | `'1'` = primary insurance |
-| `status` | string | `'Active'` = current active record |
-| `payer_type_name` | string | Insurance type (e.g., `"Medicare"`, `"Commercial"`) |
+| `status` | string | One of `'Active'` or `'Undetermined'` is treated as current (see MLID-2192) |
+| `payer_type_name` | string | Insurance type (e.g., `"Medicare"`, `"Medicare Supplement"`, `"Medicare Advantage"`, `"Commercial"`) |
 | `insurance_plan_name` | string | Bridge to `insurance_plans.planName` |
 
 ### `insurance_plans` (NEW lookup)
@@ -76,7 +76,7 @@ neworders
 │
 └── patient (ObjectId) ─► patients._id
                            └── we_infuse_id_IV ─► patient_insurances.we_infuse_patient_id
-                                                   (WHERE priority='1' AND status='Active')
+                                                   (WHERE priority='1' AND status IN ['Active','Undetermined'])
                                                    ├── payer_type_name
                                                    └── insurance_plan_name ─► insurance_plans.planName
                                                                                └── isPharmacyEligible: boolean
@@ -98,6 +98,10 @@ The pharmacy eligibility calculation returns a **string** with 3 possible outcom
 > **Updated 3/4/2026:** The drug check changed from "must be explicitly `true`" to "must not be explicitly `false`". Drugs with `pharmacyEligible: null` or `undefined` are now treated as eligible.
 >
 > **Updated 3/24/2026:** Added treatment check — if the drug is a treatment (`is_treatment == true`), the order is automatically not pharmacy eligible.
+>
+> **Updated 5/5/2026 (MLID-2192):** The primary-insurance lookup now accepts both `status: 'Active'` and `status: 'Undetermined'`, not just `'Active'`. Records still in triage (status `Undetermined`) are treated as current.
+>
+> **Updated 5/5/2026 (MLID-2194):** `payer_type_name = 'Medicare Supplement'` was added to the auto-pass allow-list alongside `'Medicare'` and `'Medicare Advantage'`.
 
 ### Insurance condition
 
@@ -105,7 +109,7 @@ The insurance check has two paths:
 
 | Payer Type | Condition |
 |-----------|-----------|
-| `"Medicare"` or `"Medicare Advantage"` | **Auto-pass** — no further check needed |
+| `"Medicare"`, `"Medicare Advantage"`, or `"Medicare Supplement"` | **Auto-pass** — no further check needed |
 | `"Commercial"` or `"Medicaid"` | Pass **only if** the matching `insurance_plans` record has `isPharmacyEligible == true` |
 | Any other type | **Fail** |
 
@@ -115,7 +119,7 @@ The insurance check has two paths:
 order
 │
 ├── 1. Does the patient have primary active insurance?
-│   └──► patient_insurances (priority='1', status='Active')
+│   └──► patient_insurances (priority='1', status IN ['Active','Undetermined'])
 │        └── No insurance found → "Waiting on Insurance Input" (stop here)
 │
 ├── 2. Is the drug a treatment?
@@ -128,7 +132,7 @@ order
 │   └──► site.isPharmacyEligible == true?
 │
 ├── 5. Does the insurance meet pharmacy criteria?
-│   ├── Medicare / Medicare Advantage → auto-pass
+│   ├── Medicare / Medicare Advantage / Medicare Supplement → auto-pass
 │   ├── Commercial / Medicaid → check insurance_plans.isPharmacyEligible == true
 │   └── Other → fail
 │
@@ -233,11 +237,11 @@ Only needed when payer type is `"Commercial"` or `"Medicaid"`. The `$lookup` alw
                 // Insurance meets criteria
                 {
                   $or: [
-                    // Medicare / Medicare Advantage → auto-pass
+                    // Medicare / Medicare Advantage / Medicare Supplement → auto-pass
                     {
                       $in: [
                         { $arrayElemAt: ['$_primaryInsurance.payer_type_name', 0] },
-                        ['Medicare', 'Medicare Advantage']
+                        ['Medicare', 'Medicare Advantage', 'Medicare Supplement']
                       ]
                     },
                     // Commercial / Medicaid with eligible plan

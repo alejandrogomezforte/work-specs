@@ -1,0 +1,51 @@
+{
+  "_id": {
+    "$oid": "69f4b91f50ec5fb019e960fb"
+  },
+  "displayId": "04dT",
+  "site": {
+    "_id": {
+      "$oid": "67b7083a8532e12fdce9d61c"
+    },
+    "isPharmacyEligible": true
+  },
+  "patient": {
+    "_id": {
+      "$oid": "69f3785bd5d0cfeda77db9e8"
+    },
+    "we_infuse_id_IV": 1159809
+  },
+  "drug": {
+    "_id": {
+      "$oid": "698507630c83fd8007e79e6c"
+    },
+    "is_treatment": false
+  },
+  "checks": {
+    "gate1_hasPrimaryInsurance": true,
+    "gate2_drugIsTreatment": false,
+    "gate3_drugNotExplicitlyIneligible": true,
+    "gate4_siteIsPharmacyEligible": true,
+    "payerTypeName": "Commercial",
+    "gate5_pathA_medicareMatches": false,
+    "gate5_pathB_commercialOrMedicaidMatches": true,
+    "gate5_pathB_planIsPharmacyEligible": true
+  },
+  "pharmacyEligible": "Yes",
+  "primaryInsurance": {
+    "_id": {
+      "$oid": "69f4ce506eb92d6bba0d94bb"
+    },
+    "insurance_plan_name": "Meritain Health",
+    "payer_type_name": "Commercial",
+    "priority": "1",
+    "status": "Active"
+  },
+  "insurancePlan": {
+    "_id": {
+      "$oid": "697355c258c03cfecc353f4d"
+    },
+    "planName": "Meritain Health",
+    "isPharmacyEligible": true
+  }
+}

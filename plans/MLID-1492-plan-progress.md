@@ -227,6 +227,7 @@ Pharmacy pipeline stages + UI column. Builds on D1's shared infrastructure.
 |---------|------|---------|----|--------|--------|----------------|-------|
 | BF-1 | MLID-1955 | Location isPharmacyEligible default fix | 2 | In Development | fix/MLID-1955-location-pharmacy-eligible-default | No | |
 | EN-1 | MLID-2015 | Pharmacy eligibility: exclude treatments (is_treatment) | 2 | In QA | feature/MLID-2015-pharmacy-exclude-treatments | No | PR pushed, waiting for QA |
+| EN-2 | MLID-2194 | Pharmacy eligibility: add "Medicare Supplement" to allow-list | 4 | Done — awaiting PR | feature/MLID-2194-pharmacy-medicare-supplement | No (branched off develop) | Commit 05e7e0bb; PR doc at `docs/agomez/PR/MLID-2194.md` |
 
 ### D2-T1: Pharmacy pipeline stages (3 SP)
 
@@ -374,6 +375,7 @@ None.
 
 - MLID-1955 — Locations missing isPharmacyEligible field show incorrect eligibility (2 SP) — [Plan](./MLID-1955-location-pharmacy-eligible-default.md)
 - MLID-2015 — Pharmacy eligibility: exclude treatments (is_treatment) (2 SP) — [Plan](./MLID-2015-pharmacy-exclude-treatments.md)
+- MLID-2194 — Pharmacy eligibility: add "Medicare Supplement" to allow-list (4 SP) — [Plan](./MLID-2194-pharmacy-medicare-supplement.md)
 
 ---
 
