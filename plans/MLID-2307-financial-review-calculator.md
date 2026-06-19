@@ -703,7 +703,9 @@ This is expected and intentional behavior for mock-only scope. QA must be inform
 
 ## Stage 2 — Data Layer (next phase, planning)
 
-This section captures the data-layer findings discovered after the Stage 1 commit and the architectural decision still open between two options. It is **not** the final Stage 2 plan — that will come from a `/plan-task` pass once Option A or Option B is locked in. This is a forward-looking note that the planning conversation builds on.
+This section captures the data-layer findings discovered after the Stage 1 commit and the locked architectural decision. It is **not** the final Stage 2 plan — that will come from a `/plan-task` pass — but the shape and naming are no longer up for debate.
+
+> The PE/TL-facing proposal (with example MongoDB documents, side-by-side comparison, and the final resolution) lives at [`docs/agomez/analysis/MLID-2307-calculations-schema-options.md`](../analysis/MLID-2307-calculations-schema-options.md).
 
 ### Goal
 Replace the in-memory `FinancialCalculationsContext` + `seed.ts` with a real persistence and retrieval layer **scoped to the order** (not the patient), so the Financial Review tab can ship to production. Once Stage 2 lands, the `getCalculationsForOrder` orderId-remap shim is removed and per-order scoping is enforced at the data layer.
@@ -727,93 +729,255 @@ The Stage 1 UI is a near-clone of the existing patient-scoped financial calculat
 | Migration | `apps/web/db-update/migration/utils/patients/up-patient-fc.mjs` | Backfilled `financialCalculationsHistory: []` on every patient. Down migration removes empty arrays only. |
 | Read path | `apps/web/components/Modules/financial-calculator/financialCalculator.tsx:21` | Reads `patient?.financialCalculationsHistory` from `usePatientProvider()` — already in memory when the patient page loads. No dedicated read endpoint. |
 
-### Legacy schema vs. Stage 1 schema — fidelity gap
+### Legacy schema vs. new schema — fidelity gap
 
-The legacy `FinancialCalculationsHistory` stores **only** the three summary numbers and a markdown blob. The Stage 1 in-memory `FinancialCalculation` type stores the full `CalculationInputs` (all 9 user-entered fields) **and** `CalculationResult.summaryLines` (a structured array). This matters:
+The legacy `patients.financialCalculationsHistory[]` item stores three summary numbers wrapped as `{title,value}` pairs and a single markdown blob in `resultBreakDownText`. The new schema keeps the same intent but structures it for the order-detail UI:
 
-- The legacy schema loses the original inputs after save — you cannot re-display "what they entered" without parsing the markdown blob.
-- The Stage 1 UI **already renders** an expandable inputs grid (`CalculationBreakdown.tsx`) that depends on having the raw `inputs` object preserved.
+- **`inputs`** — the 9 user-typed form fields, stored as numbers (legacy does **not** persist these structurally; they only appear as text inside the markdown blob).
+- **`result`** — the 3 computed responsibility numbers (`drugResp`, `adminResp`, `totalResp`), as numbers (legacy wraps them as `{title,value}` strings inside `summary`).
+- **`breakdown`** — the calculation explanation, decomposed from the legacy markdown blob into structured arrays. **Important**: only `reason` is AI-generated. The bullet arrays are produced deterministically by the calculation function (mirroring the legacy `processPart()` closure, which already builds them as strings — we just capture them into arrays instead of joining into a markdown blob):
+  - `drug: string[]` — per-step bullets for the drug-cost calculation (deterministic).
+  - `admin: string[]` — per-step bullets for the admin-cost calculation (deterministic).
+  - `summary: string[]` — final totals as bullets (deterministic).
+  - `reason: string` — paragraph explanation (Azure OpenAI gpt-5-nano, mirroring the legacy `generateAiReason` flow).
+- **`author`, `calculationDate`, `createdAt`, `updatedAt`** — standard audit fields.
 
-Reusing the legacy schema verbatim in Option A or Option B would silently regress the Stage 1 UI to "summary only" — the inputs grid would have nothing to show. **Stage 2 must persist the full `CalculationInputs` + `CalculationResult.summaryLines`** regardless of which option is chosen, OR we accept that the inputs grid only shows on the in-session calculation and disappears on refresh. The cleaner choice is to extend the schema, not to truncate the UI.
+Two notes on this choice:
+
+1. The Stage 1 UI's expandable inputs grid (`CalculationBreakdown.tsx`) depends on having `inputs` preserved structurally. The legacy "summary numbers only + markdown blob" shape would silently regress the new UI.
+2. The Stage 1 in-memory type carried `result.summaryLines: string[]` — that was UI-designer scaffolding, not anchored in the actual calculation. It is **dropped** from the persisted schema; `breakdown` covers the human-readable explanation properly.
 
 ### Order collections — current state
 
-`auditLog.migration.ts:3` confirms the canonical trio: `['neworders', 'maintenanceorders', 'leadorders']`. **None of the three has a Mongoose schema** in `apps/web/models/` — they are read/written by raw driver. `Order.ts` (Mongoose) is for a different surface and uses `mapToLisaOrders` to link back to one of these collections by hex string. This affects Option A's complexity: there is no Mongoose validation to extend, so we would either write raw-driver code (which the team has been moving away from — new code is expected to use Mongoose) or introduce Mongoose models from scratch (a much bigger undertaking, since `neworders`/`maintenanceorders` are accessed by raw driver across dozens of existing files).
+`auditLog.migration.ts:3` confirms the canonical trio: `['neworders', 'maintenanceorders', 'leadorders']`. **None of the three has a Mongoose schema** in `apps/web/models/` — they are read/written by raw driver. `Order.ts` (Mongoose) is for a different surface and uses `mapToLisaOrders` to link back to one of these collections by hex string. This is why the new `ordersFinancialCalculations` collection is the right home for our data: we get Mongoose validation on a brand-new collection without taking on the (out-of-scope) work of retrofitting Mongoose onto the order collections.
 
-### Architectural options
+### Locked architecture — dedicated `ordersFinancialCalculations` collection
 
-Two viable shapes are on the table:
+Decided unanimously (Engineer + Tech Lead + Principal Engineer): a new top-level Mongoose collection `ordersFinancialCalculations` that references the source order by `orderId` + `orderCategory`.
 
-#### Option A — Embedded array on order docs (`financialCalculations` field on each order collection)
+- **Collection**: `ordersFinancialCalculations` (Mongoose model in `apps/web/models/OrdersFinancialCalculation.ts`).
+- **Foreign-key fields**: `orderId: ObjectId` and `orderCategory: "neworders" | "maintenanceorders"`. Naming follows Tech Lead's amendment — orders are first-class citizens in LISA, so the foreign-key fields are spelled in domain terms (`orderId` / `orderCategory`) rather than generic (`entityId` / `entityType`).
+- **Per-document shape**: `inputs` (9 user-typed numbers), `result` (3 computed numbers: `drugResp`, `adminResp`, `totalResp`), `breakdown` (`drug[]`, `admin[]`, `summary[]`, `reason`), `author`, `calculationDate`, plus `createdAt`/`updatedAt` timestamps. Full example document is in the analysis doc.
+- **Index**: compound `{ orderId: 1, orderCategory: 1, calculationDate: -1 }` for "list one order's calculations newest-first".
+- **Read**: `find({ orderId, orderCategory })`.
+- **Write**: `create({ orderId, orderCategory, inputs, result, breakdown, author })`.
+- **Cache**: `orderstrackercache` is untouched — inserting a calculation does not trigger an order re-cache.
+- **Adding `leadorders` later**: one enum value on `orderCategory`.
 
-Add a `financialCalculations: FinancialCalculation[]` field to documents in `neworders` (and possibly `maintenanceorders` / `leadorders` once PO confirms). Read by including the field in the existing order-detail fetch; write by `$push` to the same order doc.
+The mild ergonomic risk is the `orderCategory` discriminator — it must always be paired with `orderId` at the API and service layers, or a query could return a calculation belonging to the wrong order. Mitigation: the service-layer wrapper takes both as a single typed pair.
 
-**Pros**
-- Mirrors the legacy patient pattern — PO/engineering team is already familiar with the shape.
-- Co-located with the order — single query to load order + its calculations; no `$lookup` needed.
-- Cheap to read on the order-detail page (no extra round trip).
-- Natural "history is part of the order" mental model.
+### Example persisted document
 
-**Cons**
-- Three collections × no Mongoose models = code change spread across raw-driver writes for each collection PO confirms (`neworders` only? all three?).
-- Embedded arrays grow unboundedly. Today usage is low; in 12 months an active maintenance order could have 50+ recalculations. MongoDB document size cap (16 MB) is not a near-term risk for this payload, but updates rewrite the entire array which is wasteful.
-- Cannot easily query "all calculations by user X" or "all calculations in date range" without scanning all order docs.
-- Migration to a real collection later is painful (have to copy nested arrays out).
-- Cache invalidation: `orderstrackercache` only re-caches on order doc change. Pushing into the order **does** trigger re-cache for that order, which is desirable — but it also forces a re-cache of unrelated order fields just because we appended a calculation, which is wasteful work.
-- Indexing: no useful per-calculation index possible.
-
-#### Option B — Dedicated `financialCalculations` collection with `orderId` ref
-
-Create a new top-level collection (Mongoose model in `apps/web/models/FinancialCalculation.ts`) with documents like:
-```
+```jsonc
+// ordersFinancialCalculations document
 {
-  _id, orderId: ObjectId, orderType: 'new' | 'maintenance' | 'lead',
-  inputs: CalculationInputs, result: CalculationResult,
-  author: string, calculationDate: Date,
-  createdAt, updatedAt
+  "_id": ObjectId("663a...01"),
+  "orderId": ObjectId("662f...a1"),
+  "orderCategory": "neworders",          // "neworders" | "maintenanceorders"
+  "inputs": {
+    "deductibleMet": 100,
+    "deductibleMax": 200,
+    "coinsurance": 20,
+    "oopMet": 50,
+    "oopMax": 500,
+    "drugCost": 20,
+    "adminCost": 10,
+    "drugAssist": 5,
+    "adminAssist": 15
+  },
+  "result": {
+    "drugResp": 15,
+    "adminResp": 0,
+    "totalResp": 15
+  },
+  "breakdown": {
+    "drug": [
+      "Starting with cost $20.00.",
+      "Apply to deductible: $20.00 (remaining deductible now $80.00).",
+      "Responsibility before assistance: $20.00.",
+      "Apply drug assistance: $5.00.",
+      "Patient pays for drug: $15.00."
+    ],
+    "admin": [
+      "Starting with cost $10.00.",
+      "Apply to deductible: $10.00 (remaining deductible now $70.00).",
+      "Responsibility before assistance: $10.00.",
+      "Apply admin assistance: $10.00.",
+      "Patient pays for admin: $0.00."
+    ],
+    "summary": [
+      "Patient Drug Responsibility: $15.00",
+      "Patient Admin Responsibility: $0.00",
+      "Total Responsibility: $15.00"
+    ],
+    "reason": "Since $100 of the $200 deductible was already met, the $20 drug charge applies to the deductible. Drug assistance of $5 reduces the patient's drug payment to $15. The $10 admin charge is fully covered by $10 of admin assistance, so admin responsibility is $0."
+  },
+  "author": "alice@mylocalinfusion.com",
+  "calculationDate": ISODate("2026-05-21T17:00:08.267Z"),
+  "createdAt": ISODate("2026-05-21T17:00:08.267Z"),
+  "updatedAt": ISODate("2026-05-21T17:00:08.267Z")
 }
 ```
-Read by `find({ orderId, orderType })`; write by `insertOne`. Index on `{ orderId: 1, calculationDate: -1 }`.
 
-**Pros**
-- Uses Mongoose (the team's preferred ODM for new code) — schema validation lives in the model file.
-- Independent of `orderstrackercache` — inserting a calculation does NOT trigger an order cache rebuild for unrelated fields.
-- Supports future queries cleanly: "all calculations by author", "by date range", "for an order **and** all orders for that patient", export jobs.
-- Indexed read path; no array rewrite on append.
-- Future-proof against PO eventually wanting cross-order analytics ("how often does the Drug Cost field change between recalculations?").
-- One model + one service + one set of routes — same shape across all three order collections (just a discriminator field).
-- Pulling/restoring data is a single-collection operation, not three.
+### Mongoose model design
 
-**Cons**
-- One additional `find()` per order-detail page load (acceptable — it's an indexed lookup by `orderId`, returns a small bounded set).
-- New collection means a new entry in any audit/PHI sweep tooling. Need to confirm `services/audit` coverage.
-- Discriminator `orderType` is mildly ugly. Alternatives: separate collections per order type (rejected — same logic three times), or single field assumed-`neworders`-only until proven otherwise.
+New file: `apps/web/models/OrdersFinancialCalculation.ts`. Sub-document schemas (`inputs`, `result`, `breakdown`) are extracted so each leaf field's validators are colocated with its definition. `_id: false` on each sub-schema prevents Mongoose from minting an `_id` for the embedded blocks. Hot-reload-safe export pattern matches the convention in `apps/web/models/Order.ts`.
 
-#### Recommendation (pending PO confirmation)
+```ts
+// apps/web/models/OrdersFinancialCalculation.ts
+import mongoose, { Document, Schema } from 'mongoose';
+import { COLLECTION } from '@/utils/constants';
 
-**Option B**. The collection is small, the queries are cleanly indexed, the Mongoose-first preference is satisfied, and we keep the door open for cross-order or cross-author analytics that the PO has not asked for yet but will plausibly want once the feature is in use for a quarter. Option A's only real advantage is "one less query on the detail page" — which is not the bottleneck on that page (the page already fans out into clinical reviews, documents, etc.).
+export type OrderCategory = 'neworders' | 'maintenanceorders';
 
-If PO needs the cheapest possible Stage 2 ship (e.g., for a near-term demo), Option A on **`neworders` only** is acceptable as a stopgap with a clearly-noted migration follow-up to Option B before adding maintenance/lead.
+export interface CalculationInputs {
+  deductibleMet: number;
+  deductibleMax: number;
+  coinsurance: number;    // 0–100
+  oopMet: number;
+  oopMax: number;
+  drugCost: number;
+  adminCost: number;
+  drugAssist: number;
+  adminAssist: number;
+}
 
-### Open questions to confirm with PO before locking the option
+export interface CalculationResult {
+  drugResp: number;
+  adminResp: number;
+  totalResp: number;
+}
 
-1. **Which order collections?** `neworders` only, or also `maintenanceorders` and `leadorders`? Stage 1 is wired to render under `/orders-tracker/[category]/[orderId]/financial-review` for any category — the data layer should match.
-2. **Author/role**: who saves calculations? Any user with order-detail access, or finance-role-only? Affects authorization checks on the POST route.
-3. **Editability**: is a saved calculation immutable, or can it be edited / soft-deleted? Drives schema (`deletedAt`, `editedAt`) and UI (no edit button today).
-4. **AI-generated "Reason" markdown**: the legacy flow appends an Azure OpenAI explanation to the result. Does the new order-scoped UI also want this, or do we drop it (it's not part of Stage 1's render)?
-5. **Audit / PHI sweep**: does `services/audit` automatically cover new collections, or do we register the new collection somewhere?
-6. **Migration of legacy data**: are the items in `patients.financialCalculationsHistory` to be backfilled into the new order-scoped store, or is this a fresh start? Backfill is hard either way because the legacy items have no `orderId` — they were never linked to an order. Likely answer: fresh start, leave legacy data in place, decommission legacy UI separately.
+export interface Breakdown {
+  drug: string[];
+  admin: string[];
+  summary: string[];
+  reason: string;
+}
 
-### Workstreams (once Option B is confirmed)
+export interface OrdersFinancialCalculationDocument extends Document {
+  orderId: mongoose.Types.ObjectId;
+  orderCategory: OrderCategory;
+  inputs: CalculationInputs;
+  result: CalculationResult;
+  breakdown: Breakdown;
+  author: string;
+  calculationDate: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
 
-1. **Understand** — final PO sign-off on the 6 open questions above and on Option B.
+const CalculationInputsSchema = new Schema<CalculationInputs>(
+  {
+    deductibleMet: { type: Number, required: true, min: 0 },
+    deductibleMax: { type: Number, required: true, min: 0 },
+    coinsurance:   { type: Number, required: true, min: 0, max: 100 },
+    oopMet:        { type: Number, required: true, min: 0 },
+    oopMax:        { type: Number, required: true, min: 0 },
+    drugCost:      { type: Number, required: true, min: 0 },
+    adminCost:     { type: Number, required: true, min: 0 },
+    drugAssist:    { type: Number, required: true, min: 0 },
+    adminAssist:   { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
+const CalculationResultSchema = new Schema<CalculationResult>(
+  {
+    drugResp:  { type: Number, required: true, min: 0 },
+    adminResp: { type: Number, required: true, min: 0 },
+    totalResp: { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
+const BreakdownSchema = new Schema<Breakdown>(
+  {
+    drug:    { type: [String], default: [] },
+    admin:   { type: [String], default: [] },
+    summary: { type: [String], default: [] },
+    reason:  { type: String, default: '' },
+  },
+  { _id: false }
+);
+
+const OrdersFinancialCalculationSchema = new Schema<OrdersFinancialCalculationDocument>(
+  {
+    orderId: {
+      type: Schema.Types.ObjectId,
+      required: true,
+    },
+    orderCategory: {
+      type: String,
+      enum: ['neworders', 'maintenanceorders'],
+      required: true,
+    },
+    inputs:         { type: CalculationInputsSchema, required: true },
+    result:         { type: CalculationResultSchema, required: true },
+    breakdown: { type: BreakdownSchema,    required: true },
+    author:          { type: String, required: true },
+    calculationDate: { type: Date,   required: true, default: () => new Date() },
+  },
+  { timestamps: true, collection: COLLECTION.OrdersFinancialCalculations }
+);
+
+// Compound index — list one order's calculations newest-first.
+OrdersFinancialCalculationSchema.index(
+  { orderId: 1, orderCategory: 1, calculationDate: -1 }
+);
+
+const modelName = 'OrdersFinancialCalculation';
+
+export const OrdersFinancialCalculation =
+  (mongoose.models[modelName] as mongoose.Model<OrdersFinancialCalculationDocument>) ||
+  mongoose.model<OrdersFinancialCalculationDocument>(modelName, OrdersFinancialCalculationSchema);
+
+export default OrdersFinancialCalculation;
+```
+
+**Companion change** — add the collection name to `apps/web/utils/constants/collections.ts`:
+
+```ts
+export const COLLECTION = {
+  // ...existing entries...
+  OrdersFinancialCalculations: 'ordersFinancialCalculations',
+} as const;
+```
+
+**Design notes**
+
+- **Sub-schemas (`_id: false`)** — each of `inputs`, `result`, `breakdown` is a defined Schema rather than an inline object literal. Two reasons: (1) Mongoose's `min`/`max`/`enum`/`required` validators are colocated with the field they protect, (2) we avoid Mongoose minting redundant `_id` fields on the embedded blocks.
+- **No `summaryLines` on `result`** — explicitly dropped from the Stage 1 in-memory shape; the human-readable explanation lives in `breakdown`.
+- **`calculationDate` defaults to `Date.now`** — but is a separate field from the Mongoose-managed `createdAt`. They are usually identical, but kept distinct so a future "calculation as of historical date" flow (e.g., what-if scenarios against a past insurance snapshot) doesn't need a schema migration.
+- **No `editedAt` / `deletedAt`** — saved calculations are immutable (PO confirmed in Jira: "simple for now"). No edit / delete / soft-delete. Schema stays as-is.
+- **Index strategy** — single compound `{ orderId: 1, orderCategory: 1, calculationDate: -1 }` covers the only known read pattern (list an order's calculations newest-first). Author-filter index `{ author: 1, calculationDate: -1 }` deferred until a UX need surfaces — easy to add later, free to leave off now.
+
+### Open questions (status)
+
+Resolved during the planning conversation:
+
+- ✅ **Which order collections** — `neworders` and `maintenanceorders` (no `leadorders`). PO confirmed.
+- ✅ **AI-generated breakdown** — kept, but persisted as a structured `breakdown` block (`drug[]`, `admin[]`, `summary[]`, `reason`) instead of a single markdown blob. See the fidelity-gap section above.
+- ✅ **Audit / PHI sweep registration** — no centralized PHI sweep / audit-registry exists today (`services/audit` is domain-specific document-propagation logging only). Nothing to register.
+- ✅ **Authorization** — any user with order-detail access can save a calculation. No finance-role gate for Stage 2; a tighter role gate is deferred to a follow-up ticket (PO consultation pending).
+- ✅ **Editability** — saved calculations are **immutable**. No edit, no delete, no soft-delete. PO confirmed in the Jira ticket comments — "this should be simple for now". No `editedAt` / `deletedAt` fields on the schema.
+- ✅ **Legacy data migration** — fresh start. Items in `patients.financialCalculationsHistory[]` are **not** backfilled into the new order-scoped store (they have no `orderId` and were never linked to an order anyway). Legacy data stays in place; legacy UI is decommissioned separately.
+
+Still open:
+
+1. **AI-breakdown timing** — is `breakdown` populated synchronously during `POST` via an Azure OpenAI call (mirroring the legacy `gpt-5-nano` flow), or deferred to a follow-up enrichment job? Held pending an investigation of how the legacy patient-scoped flow integrates with Azure OpenAI today; the decision is part of pre-Stage-2 understanding work, not a blocker on the schema itself.
+
+### Workstreams
+
+1. **Understand** — investigate the legacy patient-scoped flow's Azure OpenAI integration (`apps/web/pages/api/patients/[id]/financialCalculation.ts` — the `gpt-5-nano` call that produces the markdown blob today). Goal: understand the prompt, model parameters, error handling, and latency profile so we can decide whether to replicate it synchronously in `POST` or defer to a follow-up enrichment job. This is the only remaining input to the Stage 2 plan-task pass.
 2. **Analyze** — confirm whether the legacy patient-scoped flow stays or sunsets after the new flow ships (deprecation of `/patient/[id]/financial-calculator` is a separate ticket).
 3. **Design**
-   - `apps/web/models/FinancialCalculation.ts` Mongoose schema with `CalculationInputs`, `CalculationResult`, `orderId`, `orderType`, author, dates.
-   - REST contract: `GET /api/orders/[orderType]/[orderId]/financial-calculations`, `POST /api/orders/[orderType]/[orderId]/financial-calculations`. (Route shape tentative — pin down once Option B is locked.)
-   - Service layer in `apps/web/services/mongodb/financialCalculations.ts` (Mongoose, NOT raw driver).
-   - Index strategy: `{ orderId: 1, calculationDate: -1 }`, plus optional `{ author: 1 }` if author-filtering is in scope.
-   - Authorization rules (default to any-user-with-order-detail-access, tighten if PO says finance-role only).
+   - `apps/web/models/OrdersFinancialCalculation.ts` Mongoose schema (full design above) with `inputs`, `result`, `breakdown`, `orderId`, `orderCategory`, `author`, `calculationDate`, timestamps. No `editedAt` / `deletedAt` (saved calculations are immutable per PO).
+   - REST contract: `GET /api/orders/[orderCategory]/[orderId]/financial-calculations`, `POST /api/orders/[orderCategory]/[orderId]/financial-calculations`. URL param value maps directly to the DB `orderCategory` field (`"neworders"` | `"maintenanceorders"`). Final route shape pinned down during Stage 2 implementation.
+   - Service layer in `apps/web/services/mongodb/ordersFinancialCalculation.ts` (Mongoose, NOT raw driver). Wrapper always takes `orderId` + `orderCategory` together to avoid the discriminator footgun.
+   - Index strategy: `{ orderId: 1, orderCategory: 1, calculationDate: -1 }`. No `{ author: 1 }` index in Stage 2 — deferred until a UX need for author-filtering surfaces.
+   - Authorization: any authenticated user with order-detail access can `POST`. Role gate deferred to a follow-up ticket pending PO consultation.
+   - Pin down AI-breakdown timing (synchronous vs. deferred enrichment) once the Understand step lands.
 4. **Build**
    - Add Mongoose model + service layer with TDD.
    - Add API routes with TDD.
@@ -840,294 +1004,13 @@ If PO needs the cheapest possible Stage 2 ship (e.g., for a near-term demo), Opt
 
 ---
 
-## Stage 2 — Data Model Proposal for PE / TL Review
+## Stage 2 — Data Model Decision Record
 
-> Self-contained section — share this with the Principal Engineer and Tech Lead. Everything they need to weigh in is below; the rest of this doc is for my own context.
+The original PE/TL-facing proposal, including the side-by-side comparison of the alternatives that were considered and rejected, the example MongoDB document, the naming-amendment note, and the **final resolution (unanimous Option B, 3 of 3)**, lives at:
 
-### Context (one paragraph)
+[`docs/agomez/analysis/MLID-2307-calculations-schema-options.md`](../analysis/MLID-2307-calculations-schema-options.md)
 
-We are adding a new **Financial Review** tab to the Order Details v2 dashboard. It lets a user run a patient-responsibility calculation against a specific order and save a history of those calculations, scoped to that order. There is an existing patient-scoped equivalent at `/patient/[id]/financial-calculator` that writes a subdocument array to `patients.financialCalculationsHistory[]` (raw MongoDB driver, no Mongoose). PO has confirmed we want the new flow scoped to the **order**, not the patient, and limited to `neworders` and `maintenanceorders` (not `leadorders`). Stage 1 (UI with in-memory mock data) is committed locally on `feature/MLID-2307-financial-review`. Stage 2 is the data layer; we need to lock the shape before building.
-
-### What gets persisted (same for either option)
-
-This is the per-calculation payload that needs to be stored. Same 9 inputs + result shape as the Stage 1 UI already renders:
-
-```ts
-type FinancialCalculation = {
-  _id: ObjectId;
-  // 9 user-entered fields
-  inputs: {
-    deductibleMet: number;
-    deductibleMax: number;
-    coinsurance: number;     // 0-100
-    oopMet: number;
-    oopMax: number;
-    drugCost: number;
-    adminCost: number;
-    drugAssist: number;
-    adminAssist: number;
-  };
-  // Computed by a pure function in apps/web/.../financial-review/_components/calculate.ts
-  result: {
-    drugResp: number;
-    adminResp: number;
-    totalResp: number;
-    summaryLines: string[];  // human-readable explanation lines, built from inputs
-  };
-  author: string;            // user email from NextAuth session
-  calculationDate: Date;
-  createdAt: Date;
-  updatedAt: Date;
-};
-```
-
-Note: this is a **richer schema than the legacy `patients.financialCalculationsHistory`**, which only stored summary numbers + a markdown blob. The Stage 1 UI depends on `inputs` and `summaryLines` being present to render its inputs grid and breakdown view. Whichever option is chosen, we need to persist this full shape.
-
-### Current state of the order collections — important fact
-
-`neworders`, `maintenanceorders`, and `leadorders` are all accessed via **raw MongoDB driver** (`db.collection(COLLECTION.NewOrders)`). **None of them has a Mongoose model.** The `apps/web/models/Order.ts` Mongoose model is for the unrelated `orders` collection (WeInfuse-mirrored), not these. This affects Option A more than Option B (see below).
-
----
-
-### Option A — Embedded array on each order document
-
-Add a `financialCalculations: FinancialCalculation[]` field to documents in `neworders` and `maintenanceorders`. Read it by including the field on the existing order-detail fetch. Write it by `$push` to the parent order doc.
-
-**Proposed structure**
-
-```ts
-// On every document in neworders and maintenanceorders:
-{
-  _id: ObjectId,
-  // ... existing order fields ...
-  financialCalculations: [
-    {
-      _id: ObjectId,
-      inputs: { deductibleMet, deductibleMax, coinsurance, oopMet, oopMax,
-                drugCost, adminCost, drugAssist, adminAssist },
-      result: { drugResp, adminResp, totalResp, summaryLines: string[] },
-      author: 'user@mylocalinfusion.com',
-      calculationDate: ISODate(...),
-      createdAt: ISODate(...),
-      updatedAt: ISODate(...),
-    },
-    // ...
-  ],
-}
-```
-
-**Reads** ride along with the existing order fetch — no extra query.
-
-**Writes** use the raw driver (consistent with how `neworders` and `maintenanceorders` are touched everywhere else):
-
-```ts
-// apps/web/services/mongodb/financialCalculations.ts
-export async function pushFinancialCalculation(
-  orderType: 'new' | 'maintenance',
-  orderId: ObjectId,
-  calc: Omit<FinancialCalculation, '_id'>
-) {
-  const collectionName = orderType === 'new'
-    ? COLLECTION.NewOrders
-    : COLLECTION.MaintenanceOrders;
-  const { db } = await connectToDatabase();
-  return db.collection(collectionName).updateOne(
-    { _id: orderId },
-    { $push: { financialCalculations: { _id: new ObjectId(), ...calc } } }
-  );
-}
-```
-
-**Migration** to backfill empty arrays (`db-update/migration/utils/orders/up-orders-financial-calculations.mjs`), mirroring the existing `up-patient-fc.mjs` pattern.
-
-**Pros**
-- Single query to load order + its calculations (no `$lookup`).
-- Mirrors the legacy patient-scoped pattern — familiar shape.
-- Append is one `$push`; no separate transactional concern.
-- Cache: `orderstrackercache` already re-caches on order doc change, so saved calculations show up automatically next time the cache is touched.
-
-**Cons**
-- **No Mongoose schema for these collections today.** "Adding the field to the schema" really means either (a) keep using raw driver — no validation, matches the legacy patient pattern but conflicts with the team's stated direction of using Mongoose for all new database code — or (b) introduce brand-new Mongoose models for `neworders` + `maintenanceorders` (huge scope — dozens of files would need to be touched to migrate from raw driver to Mongoose). Realistically, this option is raw-driver-only for Stage 2.
-- Embedded arrays grow unboundedly. Each save rewrites the array. Not a near-term storage problem, but wasteful on updates.
-- Forces a re-cache of the entire order doc in `orderstrackercache` every time a calculation is saved (even though the change is unrelated to the cached columns).
-- Hard to query across orders (e.g. "all calculations by user X this week", "average totalResp by drug") — would need `$unwind`.
-- Migration to a separate collection later is expensive (have to copy nested arrays out and rewrite call sites).
-- Schema duplication across `neworders` and `maintenanceorders` — both collections grow a new field independently.
-
----
-
-### Option B — Dedicated collection
-
-Create a new top-level collection for financial calculations, with a reference to the source order. Two sub-shapes are viable; we need to pick one.
-
-#### Option B.1 — Single collection with `orderType` discriminator
-
-One collection: `financialCalculations`. Each document carries an `orderType` field that says which order collection the `orderId` points at.
-
-```ts
-// apps/web/models/FinancialCalculation.ts (NEW)
-import mongoose, { Schema, Document } from 'mongoose';
-import { COLLECTION } from '@/utils/constants';
-
-export type OrderType = 'new' | 'maintenance';
-
-export interface FinancialCalculationDocument extends Document {
-  orderId: mongoose.Types.ObjectId;     // _id in neworders OR maintenanceorders
-  orderType: OrderType;                 // discriminator: which collection orderId points at
-  inputs: {
-    deductibleMet: number;
-    deductibleMax: number;
-    coinsurance: number;
-    oopMet: number;
-    oopMax: number;
-    drugCost: number;
-    adminCost: number;
-    drugAssist: number;
-    adminAssist: number;
-  };
-  result: {
-    drugResp: number;
-    adminResp: number;
-    totalResp: number;
-    summaryLines: string[];
-  };
-  author: string;
-  calculationDate: Date;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const FinancialCalculationSchema = new Schema<FinancialCalculationDocument>(
-  {
-    orderId: { type: Schema.Types.ObjectId, required: true, index: true },
-    orderType: {
-      type: String,
-      enum: ['new', 'maintenance'],
-      required: true,
-      index: true,
-    },
-    inputs: {
-      deductibleMet: { type: Number, required: true, min: 0 },
-      deductibleMax: { type: Number, required: true, min: 0 },
-      coinsurance:   { type: Number, required: true, min: 0, max: 100 },
-      oopMet:        { type: Number, required: true, min: 0 },
-      oopMax:        { type: Number, required: true, min: 0 },
-      drugCost:      { type: Number, required: true, min: 0 },
-      adminCost:     { type: Number, required: true, min: 0 },
-      drugAssist:    { type: Number, required: true, min: 0 },
-      adminAssist:   { type: Number, required: true, min: 0 },
-    },
-    result: {
-      drugResp:    { type: Number, required: true, min: 0 },
-      adminResp:   { type: Number, required: true, min: 0 },
-      totalResp:   { type: Number, required: true, min: 0 },
-      summaryLines:{ type: [String], default: [] },
-    },
-    author:          { type: String, required: true },
-    calculationDate: { type: Date,   required: true, default: () => new Date() },
-  },
-  { timestamps: true, collection: 'financialCalculations' }
-);
-
-// Compound index: list a single order's calculations newest-first.
-FinancialCalculationSchema.index({ orderId: 1, orderType: 1, calculationDate: -1 });
-
-export const FinancialCalculation =
-  (mongoose.models.financialCalculations as mongoose.Model<FinancialCalculationDocument>) ||
-  mongoose.model<FinancialCalculationDocument>(
-    'financialCalculations',
-    FinancialCalculationSchema
-  );
-```
-
-**Read** (one indexed query):
-```ts
-FinancialCalculation.find({ orderId, orderType }).sort({ calculationDate: -1 }).lean();
-```
-
-**Write** (one `create`):
-```ts
-FinancialCalculation.create({ orderId, orderType, inputs, result, author });
-```
-
-**Pros**
-- Mongoose-first (aligns with the team's direction of using Mongoose for all new database code); validation lives in one file.
-- One model, one service, one set of routes — no duplication.
-- Indexed lookup; appends do not rewrite an array.
-- Doesn't touch `orderstrackercache` invalidation.
-- Easy to extend (`orderType: 'lead'` is a one-line enum change if PO ever asks).
-- Cross-order analytics are trivial: `find({ author }).sort({ calculationDate: -1 })`.
-
-**Cons**
-- The `orderType` discriminator is mildly ugly — every read needs to pass both `orderId` and `orderType`, and they must match. Easy to misuse if `orderType` is dropped at the API layer.
-- `orderId` alone is not unique across the two source collections — small but real footgun if anyone ever forgets to filter by `orderType` (in practice, ObjectIds are 96-bit unique, so a stray match is astronomically unlikely; still, the type signature is the safety net).
-- One extra collection in audit/PHI sweeps.
-
-#### Option B.2 — Two separate collections (mirrors source collections)
-
-Two collections: `newOrdersFinancialCalculations` and `maintenanceOrdersFinancialCalculations`. Same document shape as B.1 but **without** the `orderType` field. The collection name is the discriminator.
-
-```ts
-// apps/web/models/NewOrderFinancialCalculation.ts and
-// apps/web/models/MaintenanceOrderFinancialCalculation.ts
-// (Same schema body; only the model name and collection name differ.)
-```
-
-Service layer:
-```ts
-function modelFor(orderType: 'new' | 'maintenance') {
-  return orderType === 'new'
-    ? NewOrderFinancialCalculation
-    : MaintenanceOrderFinancialCalculation;
-}
-```
-
-**Pros**
-- No discriminator field — `orderId` is the natural key within each collection.
-- Mirrors the source-collection symmetry (`neworders` ↔ `newOrdersFinancialCalculations`).
-- If `neworders` and `maintenanceorders` ever diverge in their financial flow (e.g. maintenance gets extra fields like "treatment number"), the schemas can diverge cleanly.
-
-**Cons**
-- Two models, two collections, two indexes to maintain — same code two places.
-- Adding `leadorders` later means a third collection + a third model (vs. one enum value in B.1).
-- Audit / PHI sweep coverage now spans two collections instead of one.
-- Slightly more boilerplate in the service layer to dispatch by `orderType`.
-
----
-
-### Side-by-side comparison
-
-| Concern | Option A — embedded array | Option B.1 — one collection w/ discriminator | Option B.2 — two collections |
-|---|---|---|---|
-| Mongoose schema | **None** (would need to introduce, huge scope) | One new model | Two new models |
-| Aligns with team's "new code = Mongoose" direction | ❌ (raw driver) | ✅ | ✅ |
-| Read path | Free (rides on order fetch) | One indexed `find` | One indexed `find` |
-| Write path | `$push` on order | `create` on collection | `create` on collection |
-| Document growth | Order doc grows unboundedly | Fixed-size new doc per calc | Fixed-size new doc per calc |
-| `orderstrackercache` impact | Every save re-caches the order | Untouched | Untouched |
-| Cross-order analytics | Hard (`$unwind`) | Easy | Easy (but per-collection) |
-| Future "lead orders" support | Add field to a third collection | One enum value | A third collection + model |
-| Risk of mis-scoping (`orderId` collision across order types) | None (data is nested) | Real — `orderType` must always be passed | None (collection is the namespace) |
-| Migration cost from this to another shape later | High | Low | Low |
-| New collections in audit / PHI tooling | 0 | 1 | 2 |
-| Stage 2 implementation effort (rough) | Small (raw-driver `$push` + read change + migration) | Small-medium (model + service + routes + migration) | Medium (×2 of B.1) |
-
-### Recommendation (mine, for the conversation)
-
-**Option B.1** — single dedicated collection with an `orderType` discriminator. It's Mongoose-first, indexed, append-cheap, easy to extend if PO adds `leadorders` later, and avoids growing the already-large `neworders` documents. The discriminator footgun is real but easy to mitigate with a service-layer wrapper that always takes both `orderId` and `orderType` together.
-
-**Option A** is tempting because reads are free, but it permanently couples the calculation data to the order's storage shape — and we lose Mongoose validation on a brand new piece of business logic that depends on numeric inputs being well-formed.
-
-**Option B.2** is the right pick *only* if PE/TL think the two order types will diverge in financial behavior soon.
-
-### Questions for PE / TL
-
-1. **Option A vs B** — does the team have a strong existing direction on "ride along on the order doc" vs "dedicated collection" for order-scoped derived data? Any precedent we should follow?
-2. **If B, is B.1 (discriminator) or B.2 (two collections) preferred?** Specifically: do you anticipate `neworders` and `maintenanceorders` diverging on financial-calculation needs?
-3. **Mongoose vs raw driver for the new write path.** `neworders`/`maintenanceorders` are raw-driver everywhere. Is a Mongoose-first new collection (Option B) the preferred go-forward stance, or should I match the local convention?
-4. **Authorization** — any role gate on saving calculations (finance-only?), or is any user with order-detail access fine?
-5. **Immutability** — saved calculations stay immutable, or do we need edit/soft-delete? (Drives whether the schema needs `editedAt` / `deletedAt`.)
-6. **Audit / PHI sweep registration** — does a new collection need to be registered anywhere, or does `services/audit` pick it up automatically?
+That file is the historical decision record. The "Stage 2 — Data Layer (next phase, planning)" section above already reflects the locked shape and naming.
 
 ---
 
