@@ -125,7 +125,9 @@ The PoC runs as **8 small, resumable stages** (S0–S7), a grouping of the 7-ste
 
 ### Resume pointer
 
-> **Next stage to run: S0** &nbsp;|&nbsp; **Last updated: (not started)** &nbsp;|&nbsp; **Spike branch HEAD: (none yet)**
+> **Next stage to run: finish S0** &nbsp;|&nbsp; **Last updated: 2026-06-30** &nbsp;|&nbsp; **Spike branch HEAD: `ad58f5d6f` (== develop, baseline)**
+>
+> **Pick up here tomorrow:** worktree + Next 14 baseline install are done. First action is to **copy the env files** (see S0 per-stage note — the worktree has no `.env.local`), then run `npm run dev` and verify the 3 routes on Next 14. Then advance to S1.
 >
 > _Update this line at the end of each working session so the next pickup is instant._
 
@@ -137,7 +139,7 @@ The PoC runs as **8 small, resumable stages** (S0–S7), a grouping of the 7-ste
 
 | Stage | Actions | Resumable checkpoint | Status |
 |---|---|---|:--:|
-| **S0 — Setup & isolation** | Pull `develop`; `git worktree add` the spike branch (Isolation strategy); `cd` in; `npm install` to get a **Next 14 baseline**; confirm the app runs and the 3 target routes render on 14 (the "before" reference). | Worktree exists with a working Next-14 `node_modules` on disk. No commit needed (branch == `develop`). | ⬜ |
+| **S0 — Setup & isolation** | Pull `develop`; `git worktree add` the spike branch (Isolation strategy); `cd` in; `npm install` to get a **Next 14 baseline**; confirm the app runs and the 3 target routes render on 14 (the "before" reference). | Worktree exists with a working Next-14 `node_modules` on disk. No commit needed (branch == `develop`). | 🟡 |
 | **S1 — Core upgrade codemod** | Run `npx @next/codemod@canary upgrade latest` (bumps `next`→16, `react`/`react-dom`→19, `@types/*`, `eslint-config-next`; config cleanups; `middleware`→`proxy`; lint migration; installs). | Commit on spike branch: "S1 core upgrade". First view of React 19 peer-dep fallout. | ⬜ |
 | **S2 — React 19 dependency audit** | Resolve peer-dep issues surfaced by S1 (e.g. `react-input-mask`, `next-auth@4`, `react-pdf`, `react-day-picker`, `react-modal`, `react-select`); bump or replace as needed until install is clean. | Commit: "S2 react19 deps". `npm install` runs with no blocking peer errors. | ⬜ |
 | **S3 — Async params sweep** | Run the `next-async-request-api` codemod across the ~147 dynamic route files (+ test mocks). | Commit: "S3 async params". | ⬜ |
@@ -148,7 +150,16 @@ The PoC runs as **8 small, resumable stages** (S0–S7), a grouping of the 7-ste
 
 ### Per-stage notes (free-form, written when stopping mid-stage)
 
-- **S0:** —
+- **S0:** 2026-06-30 — main repo confirmed clean and up to date with `origin/develop` (0/0). Worktree created at `../li-call-processor-nextjs-v16-poc` on branch `spike/MLID-364-next16-direct-poc` (HEAD `ad58f5d6f`). Baseline `npm install` completed cleanly (exit 0); installed versions confirmed: **next 14.2.33, react 18.3.1, react-dom 18.3.1** (the expected Next 14 baseline). **Stopped here for the day (2026-06-30).**
+  - ⚠️ **BLOCKER for the baseline run — env files.** The worktree is a fresh checkout and does **not** have the gitignored `.env.local` files. They must be copied from the main folder before `npm run dev` will work. Two files exist in the main folder:
+    - `./.env.local` (repo root)
+    - `./apps/web/.env.local`
+  - **Copy commands (run tomorrow from the main folder `C:\Users\alejandro.gomez\Dev\li-call-processor`, Git Bash):**
+    ```bash
+    cp ./.env.local            ../li-call-processor-nextjs-v16-poc/.env.local
+    cp ./apps/web/.env.local   ../li-call-processor-nextjs-v16-poc/apps/web/.env.local
+    ```
+  - **Remaining for S0 (tomorrow):** (1) copy the two env files above; (2) `cd ../li-call-processor-nextjs-v16-poc && npm run dev`; (3) confirm `/intakes`, `/admin`, `/orders-tracker` render on Next 14 (the "before" reference); (4) mark S0 ✅ and advance the resume pointer to S1.
 - **S1:** —
 - **S2:** —
 - **S3:** —
