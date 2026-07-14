@@ -471,3 +471,62 @@ Resolves **BLOCKER #1** (documented in the S6 log): `react-input-mask@2.0.4` use
 - react-input-mask replacement — small, but the fork is not a pure drop-in (children + ref API changed).
 
 **Branch:** pushed to `origin/spike/MLID-364-next16-direct-poc` (preserved, not torn down) so the team can review the concrete change-set as evidence.
+
+---
+
+## End-of-Project Conclusions and Pending Issues
+
+> **Two different objectives, do not conflate them.**
+> - **PoC objective (this spike, MLID-364):** *prove that LISA can run on Next.js 16.* — **MET.**
+> - **Real migration objective (the production MLID-364 work, planned separately):** *have LISA successfully and durably running on Next.js 16 in production* — the same green bar the team relies on every day (build, dev, **full test suite**, lint, all workspaces, all runtime surfaces). The "not yet resolved" list below is the gap between those two objectives and becomes the backlog for the real migration plan.
+
+### What was successfully achieved
+
+The PoC proved LISA can run on Next 16. Concretely:
+
+- **The hardest path was taken and it worked** — a single **direct 14 → 16 / React 18 → 19 jump** (no staging), run on an isolated git worktree so breakage was free.
+- **Production build is GREEN** — `npm run build:web` completes with no errors on **Next.js 16.2.9 (webpack) + React 19.2.7**. All **64** React 19 / Next 16 type errors were fixed (not catalogued), and `next.config.mjs` was cleaned of every removed/renamed key.
+- **Dev runtime is clean and browser-verified** — `npm run dev:web` boots clean; **Google login works end-to-end** and **masked/phone inputs render correctly**, both confirmed live in the browser by the user. The three target routes (`/intakes`, `/admin`, `/orders-tracker`) are reachable.
+- **Both hard blockers were resolved** (each a user-owned third-party upgrade):
+  - **NextAuth v4 → Auth.js v5** (`next-auth@5.0.0-beta.31`, pinned) — async `cookies()`/`params` incompatibility fixed. Real blast radius **~336 files** (S7a, `41e54b08b`).
+  - **`react-input-mask` → `@mona-health/react-input-mask@3.0.3`** — removed the React-19-incompatible `findDOMNode` (S7b, `d2cff3bf4`).
+- **Mechanical migrations completed** — async `params` migrated across **71 source files** (S3); `middleware` → `proxy` rename (S1); `react-select` 5.8 → 5.10.2 (React 19 type collapse, S5).
+- **Lint moved to ESLint 9 flat config** for the LISA scope (`apps/web`, `packages/ui`, `packages/eslint-config`, `apps/kiosk`, root) — **config-only, zero source files touched** (S6c, `cd5700508`), so it can land against an active team without conflicts.
+- **Evidence preserved** — spike branch pushed to `origin/spike/MLID-364-next16-direct-poc`, worktree kept, so the team can review the concrete change-set.
+
+**Conclusion: the PoC objective is met — LISA runs on Next 16, in both build and dev, with the two library blockers solved.**
+
+### What is not yet resolved and will be needed to address soon (real-migration backlog)
+
+Acceptable to leave open for a PoC, but **must be closed for the real migration** (LISA durably running on Next 16). Grouped by area:
+
+1. **Test suite — the largest gap. `npm test` is not green.**
+   - **~130 async-params PAGE tests** (`[id]/page.test.tsx`: ai-chat-settings, locations, drug-admin-panel drugs, insurance-payors guidelines, insurance-plans) need the render restructured for React 19 async `use()` — `params={Promise.resolve({...})}` **plus** `act()`-wrapped async render. Per-suite work, not a find-and-replace (see S6b log).
+   - **~156 test files still mock NextAuth v4** (`getServerSession`) — must migrate to Auth.js v5 `auth()` mocking (see S7a: 156 test files deferred).
+   - **~54 masked-input test failures** still mock the old `react-input-mask` — must move to the `@mona-health` fork (see S6b / S7b).
+   - **~69 API-route `params` mocks** pass synchronous `params` — currently harmless (`isolatedModules` transpiles without type-checking), optional type-accuracy cleanup (see S3 / S6b).
+   - **`app/layout.test.tsx` (RootLayout)** — `reactRender is not a function` + `RangeError: Maximum call stack exceeded`; React 19 render-helper/layout issue, **not yet investigated** (see S6b log).
+
+2. **Auth.js v5 hardening.**
+   - Running on a **beta dependency** (`next-auth@5.0.0-beta.31`, no stable v5) — revisit when v5 goes stable.
+   - **Session cookie name changed** (`next-auth.*` → `authjs.*`) → all existing sessions invalidated on deploy (one-time forced re-login) — plan and communicate for production.
+
+3. **Turbopack migration.** PoC kept webpack (`--webpack` on dev + build). The **webpack → Turbopack** migration was deferred to a separate future ticket.
+
+4. **Lint backlog (real cleanup, deferred by design).**
+   - The ESLint 9 landing was config-only: it **ignored folders `next lint` never linted** (`services/`, `utils/`, `db-update/`, `scripts/`, `buildserver/`, `e2e/`, `tests/`, `__mocks__/`) and **downgraded noisy rules to `warn`**. The underlying backlog (**~800 pre-existing issues**: ~366 `console` calls, ~289 formatting, etc.; ~248 web warnings) is untouched (see S6c log).
+   - **`apps/api` and `apps/mcp` were reverted to develop** — still on ESLint 8 legacy `.eslintrc`; their flat-config migration is not done.
+   - **Perf:** `apps/web` `eslint .` runs ~2 min (Prettier per file) — worth a CI-time look.
+
+5. **Other workspaces / surfaces.**
+   - **`apps/storybook`** still on **React ^18** — not migrated (outside the web run path).
+   - **`pages/api/**/*.test.ts` (29 files) are built as live API routes** (because `pageExtensions: ['ts','tsx']`) — a pre-existing smell surfaced by the v5 ESM build, needs separate cleanup (see S7a gotchas).
+
+6. **Runtime verification gaps (broaden before production).**
+   - **`react-pdf` under forced SWC minify** — Next 16 always applies SWC minification (the old `swcMinify: false` was "required for react-pdf v10"); build passed but a dedicated runtime confirmation of react-pdf rendering is still open (S5 watch item).
+   - **`react-modal@3.16.1`** and **`react-collapsible@2.10.0`** (both declare React ≤18 peers) were flagged "verify at runtime, bump if it breaks" (S2) — not yet confirmed.
+   - Only login + masked inputs + reachability of the 3 target routes were browser-verified; a **broader route-by-route runtime pass** is still needed.
+
+7. **PoC housekeeping.**
+   - **S8 teardown skipped on purpose** (worktree kept, branch pushed to preserve evidence) — clean up when the real migration lands.
+   - **Jira comment `37197`** on MLID-364 still needs updating to record that both blockers are resolved and the branch is pushed.
