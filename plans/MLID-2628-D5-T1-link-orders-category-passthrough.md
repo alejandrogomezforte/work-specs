@@ -8,7 +8,7 @@
 - **Branch**: `feature/MLID-2628-link-orders-category-passthrough` (new branch, off the epic).
 - **Base Branch**: `epic/MLID-2417-document-notifications-maintenance`.
 - **Epic Plan**: `docs/agomez/plans/MLID-2417-plan-progress.md`.
-- **Status**: To Do.
+- **Status**: Done — merged into the epic (`--no-ff` `0b22bbf41`) 2026-06-29. Implemented in a single pass (the 3-stage rollout below was collapsed: no backward-compatible dual-shape window is needed for an atomic Next.js deploy of an undeployed epic). Verified end-to-end on maintenance order `010w` (both senders); see `docs/agomez/testing/MLID-2628.md`.
 
 ---
 
@@ -40,11 +40,21 @@ This is a write-path correctness/cleanliness improvement, not a hot path — but
 - Calls `DocumentOrderLinkApiService.linkDocumentToOrders(documentId, lisaOrderIds)` in `apps/web/components/Modules/document-intake/components/submission-api.ts`, which sends `linkedOrderIds: orderIds`.
 - `lisaOrderIds` is either:
   - `createdLisaOrderIds` — orders just created during this intake; their category equals the intake's `selectedType` (`'new' | 'maintenance'`, from `order.orderTypeReview.selectedType`), or
-  - `[selectedExistingOrderId]` — an existing order picked in the "update" flow from `existingOrders` (`ExistingOrderOption`). That option list is built by `useLisaOrderOptions` → `getLisaOrderOptions` in `apps/web/services/mongodb/lisaOrders.ts`, which **knows** the category (it builds the `"(${category})"` label) but returns only `{ id, label }`.
+  - `[selectedExistingOrderId]` — an existing order picked in the "update" flow from `existingOrders` (`ExistingOrderOption`). That option list is fetched by the `useLisaOrderOptions` hook (`apps/web/components/Modules/document-intake/forms/OrderTypeReview/useLisaOrderOptions.ts`) from `GET /api/orders/lisa/by-patient`, which calls `queryLisaOrdersByPatient` in `apps/web/services/mongodb/lisaOrders.ts`. That query **knows** the category (it builds the `"(${category})"` label) but returns only `{ id, label }`.
 
-**Server source already has it too**: `getLisaOrderOptions(patientId, category)` receives `category` as a parameter and uses it to pick the collection and build the label, then omits it from the returned `LisaOrderOption`.
+**Server source already has it too**: `queryLisaOrdersByPatient(db, patientObjectId, category)` receives `category` as a parameter, adds it into the aggregation (`$addFields: { category }` and projects it), uses it to build the label, then **discards it in the final `.map`** (returns only `{ id, label }`). The value is already in scope at the return — it only needs to be included in the returned object.
 
-So no new database reads are needed anywhere to obtain the category — only stop discarding it.
+**Wire path for the option list** (no DB change needed, just stop discarding the field):
+
+```
+queryLisaOrdersByPatient (lisaOrders.ts, computes category, drops it)
+  → GET /api/orders/lisa/by-patient/route.ts (calls it for 'new' + 'maintenance', concatenates)
+  → useLisaOrderOptions hook (returns data.orders as-is; re-exports LisaOrderOption)
+  → mapped to ExistingOrderOption[] in the OrderForm / UpdateOrderForm layer
+  → useSubmissionProcessor LINK_DOCUMENT_TO_LISA_ORDER callback
+```
+
+So no new database reads are needed anywhere to obtain the category — only stop discarding it and forward it through the existing wire path above.
 
 ---
 
@@ -132,9 +142,12 @@ These fail because the helper currently ignores category and always probes.
 ### Step 2.1 (GREEN+RED) — Carry category on the option/row types
 
 **Files:**
-- `apps/web/services/mongodb/lisaOrders.ts` — add `category: 'new' | 'maintenance'` to `LisaOrderOption` and include it in the object returned by `getLisaOrderOptions` (the value is already in scope).
+- `apps/web/services/mongodb/lisaOrders.ts` — add `category: 'new' | 'maintenance'` to the `LisaOrderOption` interface and include `category` in the object returned by the final `.map` of `queryLisaOrdersByPatient` (the value is already computed via `$addFields: { category }` and in scope at the map — it is currently dropped, returning only `{ id, label }`). **Note:** the plan originally named a `getLisaOrderOptions` function; no such function exists — the real symbol is `queryLisaOrdersByPatient(db, patientObjectId, category)`.
+- `apps/web/app/api/orders/lisa/by-patient/route.ts` — no logic change; it calls `queryLisaOrdersByPatient` for `'new'` + `'maintenance'` and concatenates, so `category` flows through automatically once the map includes it. Listed here so the implementer knows it is the wire path (route is gated by `FeatureFlag.ORDER_LINK_INTAKE`).
+- `apps/web/components/Modules/document-intake/forms/OrderTypeReview/useLisaOrderOptions.ts` — no logic change; the hook returns `data.orders` as-is and re-exports `LisaOrderOption`, so `category` passes through once the type carries it.
 - `apps/web/components/Modules/document-intake/forms/OrderTypeReview/types.ts` — add `category: 'new' | 'maintenance'` to `ExistingOrderOption`.
-- Update `getLisaOrderOptions` unit tests and `useLisaOrderOptions` tests to assert `category` is present on each option.
+- **Mapping site (do not miss):** find where `LisaOrderOption[]` (from `useLisaOrderOptions`) is mapped into `ExistingOrderOption[]` — in the OrderForm / UpdateOrderForm layer (e.g. `OrderForm.tsx` / `OrderTypeReview/UpdateOrderForm.tsx`). Forward `category` in that mapping, or it is silently lost between the hook and the `existingOrders` prop.
+- Update `queryLisaOrdersByPatient` unit tests (`apps/web/services/mongodb/__tests__/lisaOrders.test.ts`) and `useLisaOrderOptions` tests to assert `category` is present on each option.
 
 ### Step 2.2 (RED) — `DocumentOrderLinkApiService.linkDocumentToOrders` sends category
 
@@ -151,7 +164,7 @@ These fail because the helper currently ignores category and always probes.
   - For `[selectedExistingOrderId]`: look up the matching `existingOrders` entry (now category-bearing) and use its `category`.
 - Update `useSubmissionProcessor` tests accordingly.
 
-> **Open item to confirm during implementation:** verify that every id in `createdLisaOrderIds` corresponds to the intake's `selectedType` (i.e., an intake never creates a mix of new + maintenance in one submission). If it can, source each created id's category from the creation result rather than from `selectedType`. This is the only place where the category mapping is not already one-to-one obvious.
+> **Resolved (was an open item):** verified in `useSubmissionProcessor.ts` — `CREATE_LISA_ORDER` sets `category = selectedType` (a single value per submission), and the base + SubQ partner (`-1`) orders are all created under that one category. A single intake submission therefore **cannot** create a mix of new + maintenance orders, so sourcing every `createdLisaOrderIds` entry's category from `selectedType` is safe.
 
 ### Step 2.4 (RED) — Patient modal sends category
 
@@ -194,8 +207,11 @@ These fail because the helper currently ignores category and always probes.
 |------|--------|-------------|
 | `apps/web/services/notifications/documentNotification.ts` | Modify | `handleOrderLink` takes `{ id, category }[]`; uses `getOrderById(id, category)`; remove the guess (Stage 3) |
 | `apps/web/app/api/documents/[documentId]/link-orders/route.ts` | Modify | Accept `linkedOrders: {id,category}[]`; pass category-bearing delta to `handleOrderLink`; persist bare ids unchanged |
-| `apps/web/services/mongodb/lisaOrders.ts` | Modify | Add `category` to `LisaOrderOption` + return it from `getLisaOrderOptions` |
+| `apps/web/services/mongodb/lisaOrders.ts` | Modify | Add `category` to `LisaOrderOption` + return it from `queryLisaOrdersByPatient`'s final `.map` (value already in scope; currently dropped) |
+| `apps/web/app/api/orders/lisa/by-patient/route.ts` | No change | Wire path only — already concatenates new + maintenance; `category` flows through once the map includes it |
+| `apps/web/components/Modules/document-intake/forms/OrderTypeReview/useLisaOrderOptions.ts` | No change | Wire path only — passes `data.orders` through; `category` flows once the type carries it |
 | `apps/web/components/Modules/document-intake/forms/OrderTypeReview/types.ts` | Modify | Add `category` to `ExistingOrderOption` |
+| OrderForm / `OrderTypeReview/UpdateOrderForm.tsx` (mapping site) | Modify | Forward `category` where `LisaOrderOption[]` → `ExistingOrderOption[]` is built (else category is lost before the `existingOrders` prop) |
 | `apps/web/components/Modules/document-intake/components/submission-api.ts` | Modify | `linkDocumentToOrders` sends `{ linkedOrders }` |
 | `apps/web/components/Modules/document-intake/components/useSubmissionProcessor.ts` | Modify | Build `{ id, category }[]` (created → `selectedType`; existing → option category) |
 | `apps/web/components/Modules/patient/components/patientDocumentRecords/LinkOrdersModal.tsx` | Modify | Send `{ linkedOrders }`, category from `lisaOrders` |
@@ -209,7 +225,7 @@ These fail because the helper currently ignores category and always probes.
 
 - **Unit — `handleOrderLink`**: one `getOrderById` call with the correct category; no second-collection call; not-found-for-category path; (Stage 1 only) back-compat fallback.
 - **Integration — link-orders route**: new shape parsed/validated; correct delta + category passed to `handleOrderLink`; bare ids persisted; legacy shape accepted in Stage 1 then rejected in Stage 3.
-- **Unit — `getLisaOrderOptions` / `useLisaOrderOptions`**: `category` present on options.
+- **Unit — `queryLisaOrdersByPatient` / `useLisaOrderOptions`**: `category` present on options.
 - **Component — `LinkOrdersModal`, intake submission**: request body carries `{ id, category }`.
 - **Manual (browser)**: link new and maintenance orders from both entry points; confirm single maintenance lookup.
 - **Regression gate**: existing new-orders link/propagation behavior unchanged.
@@ -225,4 +241,6 @@ These fail because the helper currently ignores category and always probes.
 
 ## Open Questions
 
-1. Intake `createdLisaOrderIds` → category mapping: confirm a single intake submission cannot create a mix of new and maintenance orders (see the open item in Step 2.3). If it can, source category from the creation result per id instead of from `selectedType`.
+_None remaining._
+
+**Resolved:** Intake `createdLisaOrderIds` → category mapping — confirmed from `useSubmissionProcessor.ts` that `CREATE_LISA_ORDER` uses a single `category = selectedType` per submission (base + SubQ partner `-1` orders included), so a single intake submission cannot create a mix of new and maintenance orders. Sourcing each created id's category from `selectedType` is safe (see the resolved note in Step 2.3).
